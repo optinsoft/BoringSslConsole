@@ -1,11 +1,8 @@
 # BoringSslConsole
 
-A deliberately small proof-of-concept console application that connects to
-`https://tls.peet.ws/api/tls` using BoringSSL, while BoringSSL reads and
-writes through a managed .NET `NetworkStream` via a custom BIO.
+A deliberately small proof-of-concept console application that connects to HTTPS servers using a custom .NET wrapper around BoringSSL. 
 
-The purpose of this first version is **not** to imitate Chrome. It is only to
-prove that the architecture works:
+The wrapper routes all BoringSSL native read/write operations through a managed .NET `NetworkStream` via custom BIO callbacks.
 
 ```text
 TcpClient
@@ -14,14 +11,16 @@ NetworkStream
    |
 custom BoringSSL BIO
    |
-BoringSSL
+BoringSSL (Thread-Safe Wrappers)
    |
-HTTPS
+HTTPS (Full-Duplex + X509 Validation)
 ```
 
-`TrackMe - fingerprinting API` reports the TLS protocol, cipher suites, extensions,
-JA3 and JA4, so it is useful for comparing the first BoringSSL ClientHello with
-a normal browser later. See https://tls.peet.ws/
+## Key Features
+
+- **Full-Duplex Architecture:** The native `_sslLock` has been refactored into independent read/write and network synchronization locks (`_readLock`, `_writeLock`, `_networkReadLock`, `_networkWriteLock`). This allows the .NET application to read and write over TLS concurrently without risking memory corruption or race conditions within the native OpenSSL/BoringSSL `SSL*` state machine.
+- **Certificate Validation:** Built-in cryptographic chain validation (`X509Chain`) utilizing the host operating system's trusted root certificate store. It natively enforces online revocation checks (`X509RevocationMode.Online`).
+- **Secure Hostname & Wildcard Matching:** Uses modern .NET 8 API (`certificate.MatchesHostname`) to safely validate Server Alternative Names (SAN) and Common Names (CN), including strict adherence to RFC 6125 wildcard rules (preventing sub-domain bypasses).
 
 ## Prerequisites (Windows)
 
@@ -77,20 +76,23 @@ The native DLL is copied to the .NET output directory automatically.
 
 ## What the program does
 
-1. Opens a normal TCP connection to `tls.peet.ws:443`.
-2. Creates a BoringSSL `SSL*` object.
-3. Gives BoringSSL a custom BIO.
-4. The BIO callbacks call the managed `NetworkStream`.
-5. Performs `SSL_connect()`.
-6. Sends a simple HTTP/1.1 request for `/api/tls`.
-7. Prints the HTTP response.
+1. Opens a standard TCP connection to the target server (e.g., `tls.peet.ws:443`).
+2. Creates a BoringSSL `SSL*` object and wires it to memory-isolated read and write BIOs (`BIO_s_mem`).
+3. Performs `SSL_connect()` via native callbacks.
+4. **Validates the Server Certificate:** Immediately after a successful TLS handshake, it extracts the server's DER-encoded X509 certificate via the native wrapper. It runs a full OS-level chain validation and matches the connection hostname.
+5. Prints the negotiated TLS version and cipher suite name.
+6. Sends an HTTP/1.1 `GET` request using asynchronous full-duplex stream writes.
+7. Streams the HTTP response, simultaneously printing it to the console and saving it into the `./output/` directory.
 
-Certificate verification is intentionally disabled in this first experiment.
-This is **not** suitable for production until certificate validation is added.
+## Testing Certificate Validation
 
-The native layer also reports the negotiated TLS version and cipher.
+The `Program.cs` file includes a set of pre-configured, commented-out test hosts from the **badssl.com** project to verify secure error-handling:
+
+- `tls.peet.ws` / `badssl.com` - **Standard Verification:** Connection should succeed.
+- `expired.badssl.com` - **Expiration Failure:** Handshake must fail during `X509Chain` building.
+- `untrusted-root.badssl.com` - **Trust Failure:** Handshake must fail due to an unknown root authority.
+- `revoked.badssl.com` - **Revocation Failure:** Handshake must fail because the certificate was revoked by the CA.
 
 ## Next step
 
-Once this works, capture the ClientHello in Wireshark and compare it with
-Chrome. Only then modify BoringSSL's TLS configuration/ClientHello generation.
+Capture the ClientHello in Wireshark and compare it with Chrome. Since the architecture now supports production-grade certificate validation and thread-safe streaming, you can safely proceed with fingerprinting modifications (JA3/JA4 orchestration) inside BoringSSL's ClientHello generation.
