@@ -414,4 +414,58 @@ PMS_EXPORT void PMS_CALL pms_ssl_free(
     delete connection;
 }
 
+PMS_EXPORT int PMS_CALL pms_ssl_get_peer_certificate(
+    void* connection_ptr,
+    uint8_t* buffer,
+    int max_length)
+{
+    if (!connection_ptr)
+    {
+        SetLastError("Connection is null");
+        return PMS_SSL_ERROR;
+    }
+
+    auto* connection =
+        static_cast<PmsSslConnection*>(connection_ptr);
+
+    X509* cert = SSL_get_peer_certificate(connection->ssl);
+    if (!cert)
+    {
+        SetLastError("No peer certificate found");
+        return 0;
+    }
+
+    int cert_len = i2d_X509(cert, nullptr);
+    if (cert_len <= 0)
+    {
+        SetOpenSslError("Failed to calculate certificate length");
+        X509_free(cert);
+        return PMS_SSL_ERROR;
+    }
+
+    if (!buffer)
+    {
+        X509_free(cert);
+        return cert_len;
+    }
+
+    if (max_length < cert_len)
+    {
+        SetLastError("Buffer is too small for certificate");
+        X509_free(cert);
+        return PMS_SSL_ERROR;
+    }
+
+    uint8_t* out_ptr = buffer;
+    if (i2d_X509(cert, &out_ptr) < 0)
+    {
+        SetOpenSslError("Failed to serialize certificate");
+        X509_free(cert);
+        return PMS_SSL_ERROR;
+    }
+
+    X509_free(cert);
+    return cert_len;
+}
+
 }

@@ -1,11 +1,14 @@
 using System.Buffers;
 using System.Runtime.InteropServices;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 
 public sealed class BoringSslStream : Stream
 {
     private const int NetworkBufferSize = 16 * 1024;
 
     private readonly Stream _innerStream;
+    private readonly string _hostname;
     private readonly bool _leaveOpen;
     private readonly IntPtr _connection;
 
@@ -28,6 +31,7 @@ public sealed class BoringSslStream : Stream
         ArgumentException.ThrowIfNullOrWhiteSpace(hostname);
 
         _innerStream = innerStream;
+        _hostname = hostname;
         _leaveOpen = leaveOpen;
 
         _connection = Native.pms_ssl_create(hostname);
@@ -99,6 +103,7 @@ public sealed class BoringSslStream : Stream
                     switch (result)
                     {
                         case Native.PMS_SSL_OK:
+                            ValidateServerCertificate(_hostname);
                             _authenticated = true;
                             return;
 
@@ -454,6 +459,12 @@ public sealed class BoringSslStream : Stream
             this);
     }
 
+    private static unsafe IntPtr GetHandlePointer(
+        MemoryHandle handle)
+    {
+        return (IntPtr)handle.Pointer;
+    }
+
     // ------------------------------------------------------------
     // Stream
     // ------------------------------------------------------------
@@ -764,24 +775,21 @@ public sealed class BoringSslStream : Stream
             "proxymap_boringssl",
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_get_protocol_version")]
-        internal static extern IntPtr
-            pms_ssl_get_protocol_version(
+        internal static extern IntPtr pms_ssl_get_protocol_version(
                 IntPtr connection);
 
         [DllImport(
             "proxymap_boringssl",
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_get_cipher_name")]
-        internal static extern IntPtr
-            pms_ssl_get_cipher_name(
+        internal static extern IntPtr pms_ssl_get_cipher_name(
                 IntPtr connection);
 
         [DllImport(
             "proxymap_boringssl",
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_get_last_error")]
-        internal static extern IntPtr
-            pms_ssl_get_last_error();
+        internal static extern IntPtr pms_ssl_get_last_error();
 
         [DllImport(
             "proxymap_boringssl",
@@ -789,11 +797,81 @@ public sealed class BoringSslStream : Stream
             EntryPoint = "pms_ssl_free")]
         internal static extern void pms_ssl_free(
             IntPtr connection);
+
+        [DllImport(
+            "proxymap_boringssl",
+            CallingConvention = CallingConvention.Cdecl,
+            EntryPoint = "pms_ssl_get_peer_certificate")]
+        internal static extern int pms_ssl_get_peer_certificate(
+            IntPtr connection,
+            IntPtr buffer,
+            int maxLength);
     }
 
-    private static unsafe IntPtr GetHandlePointer(
-        MemoryHandle handle)
+    // ------------------------------------------------------------
+    // Validate Server Certificate
+    // ------------------------------------------------------------
+
+    private void ValidateServerCertificate(string hostname)
     {
-        return (IntPtr)handle.Pointer;
+        int certLen = Native.pms_ssl_get_peer_certificate(_connection, IntPtr.Zero, 0);
+        if (certLen < 0)
+        {
+            throw CreateSslException("Failed to get server certificate size");
+        }
+        if (certLen == 0)
+        {
+            throw new AuthenticationException("The server did not provide an SSL certificate.");
+        }
+
+        byte[] rentBuffer = ArrayPool<byte>.Shared.Rent(certLen);
+        try
+        {
+            Memory<byte> memory = rentBuffer.AsMemory(0, certLen);
+            using (MemoryHandle handle = memory.Pin())
+            {
+                IntPtr pointer = GetHandlePointer(handle);
+                int readBytes = Native.pms_ssl_get_peer_certificate(
+                    _connection,
+                    pointer,
+                    certLen);
+
+                if (readBytes != certLen)
+                {
+                    throw CreateSslException("Failed to read complete server certificate");
+                }
+            }
+
+            using var certificate = new X509Certificate2(memory.Span);
+
+            using var chain = new X509Chain();
+            chain.ChainPolicy.RevocationMode = X509RevocationMode.Online;
+            chain.ChainPolicy.RevocationFlag = X509RevocationFlag.ExcludeRoot;
+
+            chain.ChainPolicy.ApplicationPolicy.Add(new System.Security.Cryptography.Oid("1.3.6.1.5.5.7.3.1")); // Server Auth
+
+            if (!chain.Build(certificate))
+            {
+                var errors = string.Join(", ", chain.ChainStatus.Select(s => s.StatusInformation.Trim()));
+                throw new AuthenticationException($"Certificate chain validation failed: {errors}");
+            }
+
+            if (!VerifyHost(certificate, hostname))
+            {
+                throw new AuthenticationException($"The hostname '{hostname}' does not match the server certificate.");
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rentBuffer);
+        }
+    }
+
+    private static bool VerifyHost(X509Certificate2 cert, string hostname)
+    {
+        return cert.GetNameInfo(X509NameType.DnsName, false)
+                .Equals(hostname, StringComparison.OrdinalIgnoreCase) 
+            || cert.GetNameInfo(X509NameType.SimpleName, false)
+                .Equals(hostname, StringComparison.OrdinalIgnoreCase);
     }
 }

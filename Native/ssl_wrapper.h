@@ -60,6 +60,11 @@ PMS_EXPORT const char* PMS_CALL pms_ssl_get_last_error();
 PMS_EXPORT void PMS_CALL pms_ssl_free(
     void* connection);
 
+PMS_EXPORT int PMS_CALL pms_ssl_get_peer_certificate(
+    void* connection_ptr,
+    uint8_t* buffer,
+    int max_length);
+
 #ifdef __cplusplus
 }
 #endif

@@ -5,6 +5,7 @@ using System.Text;
 
 const string host = "tls.peet.ws";
 //const string host = "kittens.sh";
+//const string host = "badssl.com";
 const string document = "/api/tls";
 const int port = 443;
 
