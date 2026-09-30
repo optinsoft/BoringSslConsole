@@ -1,292 +1,417 @@
 #include "ssl_wrapper.h"
 
-#include <openssl/bio.h>
-#include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/bio.h>
 
-#include <cstdio>
 #include <string>
 
-#ifdef _WIN32
-#include <winsock2.h>
-#endif
-
-
-struct PmsConnection {
+struct PmsSslConnection
+{
     SSL_CTX* ctx = nullptr;
     SSL* ssl = nullptr;
-    BIO* bio = nullptr;
-    BIO_METHOD* bio_method = nullptr;
-    void* user_data = nullptr;
-    pms_read_callback read_callback = nullptr;
-    pms_write_callback write_callback = nullptr;
+    std::string hostname;
 };
 
 static thread_local std::string g_last_error;
 
-static void SetLastError(const char* message) {
-    g_last_error = message ? message : "unknown error";
+static void SetLastError(const char* message)
+{
+    g_last_error = message ? message : "Unknown error";
 }
 
-static void SetOpenSslError(const char* prefix) 
+static void SetOpenSslError(const char* prefix)
 {
     unsigned long error = ERR_get_error();
-    if (error == 0) {
-        SetLastError(prefix);
+
+    if (error == 0)
+    {
+        g_last_error = prefix ? prefix : "OpenSSL error";
         return;
     }
 
     char error_string[256] = {};
-    ERR_error_string_n(error, error_string, sizeof(error_string));
-    g_last_error = std::string(prefix) + ": " + error_string;
+
+    ERR_error_string_n(
+        error,
+        error_string,
+        sizeof(error_string));
+
+    g_last_error =
+        std::string(prefix ? prefix : "OpenSSL error") +
+        ": " +
+        error_string;
 }
 
-static int BioRead(BIO* bio, char* out, int out_len) 
+static int TranslateSslError(
+    SSL* ssl,
+    int result)
 {
-    auto* connection = static_cast<PmsConnection*>(BIO_get_data(bio));
-    if (!connection || !connection->read_callback) {
-        SetLastError("Invalid read callback");
-        return -1;
-    }
+    int error = SSL_get_error(ssl, result);
 
-    return connection->read_callback(
-        connection->user_data,
-        reinterpret_cast<uint8_t*>(out),
-        out_len);
-}
+    switch (error)
+    {
+        case SSL_ERROR_NONE:
+            return PMS_SSL_OK;
 
-static int BioWrite(BIO* bio, const char* in, int in_len) 
-{
-    auto* connection = static_cast<PmsConnection*>(BIO_get_data(bio));
-    if (!connection || !connection->write_callback) {
-        SetLastError("Invalid write callback");
-        return -1;
-    }
+        case SSL_ERROR_ZERO_RETURN:
+            return PMS_SSL_ZERO_RETURN;
 
-    return connection->write_callback(
-        connection->user_data,
-        reinterpret_cast<const uint8_t*>(in),
-        in_len);
-}
+        case SSL_ERROR_WANT_READ:
+            return PMS_SSL_WANT_READ;
 
-static long BioCtrl(BIO*, int cmd, long, void*) 
-{
-    switch (cmd) {
-    case BIO_CTRL_FLUSH:
-        return 1;
-    case BIO_CTRL_PENDING:
-    case BIO_CTRL_WPENDING:
-        return 0;
-    default:
-        return 1;
+        case SSL_ERROR_WANT_WRITE:
+            return PMS_SSL_WANT_WRITE;
+
+        default:
+            SetOpenSslError("SSL error");
+            return PMS_SSL_ERROR;
     }
 }
 
-static int BioCreate(BIO* bio) 
+extern "C"
 {
-    BIO_set_init(bio, 1);
-    BIO_set_data(bio, nullptr);
-    BIO_set_flags(bio, 0);
-    return 1;
-}
 
-static int BioDestroy(BIO* bio) 
+PMS_EXPORT void* PMS_CALL pms_ssl_create(
+    const char* hostname)
 {
-    if (!bio)
-        return 0;
-
-    BIO_set_data(bio, nullptr);
-    BIO_set_init(bio, 0);
-    return 1;
-}
-
-static BIO_METHOD* CreateBioMethod() 
-{
-    BIO_METHOD* method = BIO_meth_new(
-        BIO_TYPE_SOURCE_SINK,
-        "ProxyMap managed Stream BIO");
-
-    if (!method)
+    if (!hostname || !hostname[0])
+    {
+        SetLastError("Hostname is empty");
         return nullptr;
+    }
 
-    BIO_meth_set_write(method, BioWrite);
-    BIO_meth_set_read(method, BioRead);
-    BIO_meth_set_ctrl(method, BioCtrl);
-    BIO_meth_set_create(method, BioCreate);
-    BIO_meth_set_destroy(method, BioDestroy);
-    return method;
-}
+    auto* connection = new PmsSslConnection();
 
-void* PMS_CALL pms_ssl_create(
-    void* user_data,
-    pms_read_callback read_callback,
-    pms_write_callback write_callback,
-    const char* hostname) 
-{
-
-    auto* connection = new PmsConnection();
-    connection->user_data = user_data;
-    connection->read_callback = read_callback;
-    connection->write_callback = write_callback;
+    connection->hostname = hostname;
 
     connection->ctx = SSL_CTX_new(TLS_client_method());
-    if (!connection->ctx) {
+
+    if (!connection->ctx)
+    {
         SetOpenSslError("SSL_CTX_new failed");
         delete connection;
         return nullptr;
     }
 
-    // Proof of concept only. Certificate verification will be added later.
-    SSL_CTX_set_verify(connection->ctx, SSL_VERIFY_NONE, nullptr);
+    // POC only.
+    // Certificate verification should be enabled later.
+    SSL_CTX_set_verify(
+        connection->ctx,
+        SSL_VERIFY_NONE,
+        nullptr);
 
-    connection->ssl = SSL_new(connection->ctx);    
-    if (!connection->ssl) {
+    connection->ssl = SSL_new(connection->ctx);
+
+    if (!connection->ssl)
+    {
         SetOpenSslError("SSL_new failed");
         SSL_CTX_free(connection->ctx);
         delete connection;
         return nullptr;
     }
 
-    if (hostname && hostname[0] != '\0' &&
-        !SSL_set_tlsext_host_name(connection->ssl, hostname)) {
-        SetOpenSslError("SSL_set_tlsext_host_name failed");
-        SSL_free(connection->ssl);
-        SSL_CTX_free(connection->ctx);
-        delete connection;
-        return nullptr;
-    }
+    BIO* read_bio = BIO_new(BIO_s_mem());
+    BIO* write_bio = BIO_new(BIO_s_mem());
 
-    connection->bio_method = CreateBioMethod();
-    if (!connection->bio_method) {
-        SetOpenSslError("BIO_meth_new failed");
-        SSL_free(connection->ssl);
-        SSL_CTX_free(connection->ctx);
-        delete connection;
-        return nullptr;
-    }
+    if (!read_bio || !write_bio)
+    {
+        if (read_bio)
+            BIO_free(read_bio);
 
-    connection->bio = BIO_new(connection->bio_method);
-    if (!connection->bio) {
+        if (write_bio)
+            BIO_free(write_bio);
+
         SetOpenSslError("BIO_new failed");
-        BIO_meth_free(connection->bio_method);
+
         SSL_free(connection->ssl);
         SSL_CTX_free(connection->ctx);
         delete connection;
+
         return nullptr;
     }
 
-    BIO_set_data(connection->bio, connection);
-    SSL_set_bio(connection->ssl, connection->bio, connection->bio);
+    // SSL now owns both BIOs.
+    SSL_set_bio(
+        connection->ssl,
+        read_bio,
+        write_bio);
+
+    if (SSL_set_tlsext_host_name(
+            connection->ssl,
+            connection->hostname.c_str()) != 1)
+    {
+        SetOpenSslError(
+            "SSL_set_tlsext_host_name failed");
+
+        SSL_free(connection->ssl);
+        SSL_CTX_free(connection->ctx);
+        delete connection;
+
+        return nullptr;
+    }
+
+    SSL_set_connect_state(connection->ssl);
+
     return connection;
 }
 
-int PMS_CALL pms_ssl_connect(void* ptr) {
-    auto* connection = static_cast<PmsConnection*>(ptr);
-    if (!connection || !connection->ssl) {
-        SetLastError("Invalid SSL connection");
-        return 0;
+PMS_EXPORT int PMS_CALL pms_ssl_connect(
+    void* connection_ptr)
+{
+    if (!connection_ptr)
+    {
+        SetLastError("Connection is null");
+        return PMS_SSL_ERROR;
     }
+
+    auto* connection =
+        static_cast<PmsSslConnection*>(connection_ptr);
 
     int result = SSL_connect(connection->ssl);
-    if (result == 1)
-        return 1;
 
-    int error = SSL_get_error(connection->ssl, result);
-    char message[128] = {};
-    std::snprintf(message, sizeof(message), "SSL_connect failed, error=%d", error);
-    SetOpenSslError(message);
-    return 0;
+    if (result == 1)
+        return PMS_SSL_OK;
+
+    return TranslateSslError(
+        connection->ssl,
+        result);
 }
 
-int PMS_CALL pms_ssl_read(void* ptr, uint8_t* buffer, int offset, int length) {
-    auto* connection = static_cast<PmsConnection*>(ptr);
-    if (!connection || !connection->ssl || !buffer || offset < 0 || length <= 0) {
-        SetLastError("Invalid SSL_read arguments");
-        return -1;
+PMS_EXPORT int PMS_CALL pms_ssl_feed_read(
+    void* connection_ptr,
+    const uint8_t* buffer,
+    int length)
+{
+    if (!connection_ptr)
+    {
+        SetLastError("Connection is null");
+        return PMS_SSL_ERROR;
     }
 
-    int result = SSL_read(connection->ssl, buffer + offset, length);
-    if (result > 0)
-        return result;
+    if (!buffer && length > 0)
+    {
+        SetLastError("Buffer is null");
+        return PMS_SSL_ERROR;
+    }
 
-    int error = SSL_get_error(connection->ssl, result);
-    if (error == SSL_ERROR_ZERO_RETURN)
+    if (length == 0)
         return 0;
 
-    if (error == SSL_ERROR_SYSCALL) {
-#ifdef _WIN32        
-        int sys_error = WSAGetLastError();
-#else
-        int sys_error = errno; 
-#endif        
-        unsigned long ossl_error = ERR_get_error();
-        if (sys_error == 0 && ossl_error == 0) {
-            return 0;
-        }
+    auto* connection =
+        static_cast<PmsSslConnection*>(connection_ptr);
+
+    BIO* bio = SSL_get_rbio(connection->ssl);
+
+    if (!bio)
+    {
+        SetLastError("Read BIO is null");
+        return PMS_SSL_ERROR;
     }
 
-    char message[128] = {};
-    std::snprintf(message, sizeof(message), "SSL_read failed, error=%d", error);
-    SetOpenSslError(message);
-    return -1;
+    int result = BIO_write(
+        bio,
+        buffer,
+        length);
+
+    if (result <= 0)
+    {
+        SetOpenSslError("BIO_write failed");
+        return PMS_SSL_ERROR;
+    }
+
+    return result;
 }
 
-int PMS_CALL pms_ssl_write(void* ptr, const uint8_t* buffer, int offset, int length) {
-    auto* connection = static_cast<PmsConnection*>(ptr);
-    if (!connection || !connection->ssl || !buffer || offset < 0 || length <= 0) {
-        SetLastError("Invalid SSL_write arguments");
-        return -1;
+PMS_EXPORT int PMS_CALL pms_ssl_take_write(
+    void* connection_ptr,
+    uint8_t* buffer,
+    int length)
+{
+    if (!connection_ptr)
+    {
+        SetLastError("Connection is null");
+        return PMS_SSL_ERROR;
     }
 
-    int result = SSL_write(connection->ssl, buffer + offset, length);
+    if (!buffer && length > 0)
+    {
+        SetLastError("Buffer is null");
+        return PMS_SSL_ERROR;
+    }
+
+    if (length == 0)
+        return 0;
+
+    auto* connection =
+        static_cast<PmsSslConnection*>(connection_ptr);
+
+    BIO* bio = SSL_get_wbio(connection->ssl);
+
+    if (!bio)
+    {
+        SetLastError("Write BIO is null");
+        return PMS_SSL_ERROR;
+    }
+
+    int result = BIO_read(
+        bio,
+        buffer,
+        length);
+
+    if (result < 0)
+    {
+        SetOpenSslError("BIO_read failed");
+        return PMS_SSL_ERROR;
+    }
+
+    return result;
+}
+
+PMS_EXPORT int PMS_CALL pms_ssl_pending_write(
+    void* connection_ptr)
+{
+    if (!connection_ptr)
+    {
+        SetLastError("Connection is null");
+        return PMS_SSL_ERROR;
+    }
+
+    auto* connection =
+        static_cast<PmsSslConnection*>(connection_ptr);
+
+    BIO* bio = SSL_get_wbio(connection->ssl);
+
+    if (!bio)
+    {
+        SetLastError("Write BIO is null");
+        return PMS_SSL_ERROR;
+    }
+
+    return static_cast<int>(
+        BIO_ctrl_pending(bio));
+}
+
+PMS_EXPORT int PMS_CALL pms_ssl_read(
+    void* connection_ptr,
+    uint8_t* buffer,
+    int length)
+{
+    if (!connection_ptr)
+    {
+        SetLastError("Connection is null");
+        return PMS_SSL_ERROR;
+    }
+
+    if (!buffer && length > 0)
+    {
+        SetLastError("Buffer is null");
+        return PMS_SSL_ERROR;
+    }
+
+    auto* connection =
+        static_cast<PmsSslConnection*>(connection_ptr);
+
+    int result = SSL_read(
+        connection->ssl,
+        buffer,
+        length);
+
     if (result > 0)
         return result;
 
-    int error = SSL_get_error(connection->ssl, result);
-    char message[128] = {};
-    std::snprintf(message, sizeof(message), "SSL_write failed, error=%d", error);
-    SetOpenSslError(message);
-    return -1;
+    return TranslateSslError(
+        connection->ssl,
+        result);
 }
 
-const char* PMS_CALL pms_ssl_get_protocol_version(void* ptr) {
-    auto* connection = static_cast<PmsConnection*>(ptr);
-    return connection && connection->ssl ? SSL_get_version(connection->ssl) : "";
+PMS_EXPORT int PMS_CALL pms_ssl_write(
+    void* connection_ptr,
+    const uint8_t* buffer,
+    int length)
+{
+    if (!connection_ptr)
+    {
+        SetLastError("Connection is null");
+        return PMS_SSL_ERROR;
+    }
+
+    if (!buffer && length > 0)
+    {
+        SetLastError("Buffer is null");
+        return PMS_SSL_ERROR;
+    }
+
+    auto* connection =
+        static_cast<PmsSslConnection*>(connection_ptr);
+
+    int result = SSL_write(
+        connection->ssl,
+        buffer,
+        length);
+
+    if (result > 0)
+        return result;
+
+    return TranslateSslError(
+        connection->ssl,
+        result);
 }
 
-const char* PMS_CALL pms_ssl_get_cipher_name(void* ptr) {
-    auto* connection = static_cast<PmsConnection*>(ptr);
-    if (!connection || !connection->ssl)
+PMS_EXPORT const char* PMS_CALL
+pms_ssl_get_protocol_version(
+    void* connection_ptr)
+{
+    if (!connection_ptr)
         return "";
 
-    const SSL_CIPHER* cipher = SSL_get_current_cipher(connection->ssl);
-    return cipher ? SSL_CIPHER_get_name(cipher) : "";
+    auto* connection =
+        static_cast<PmsSslConnection*>(connection_ptr);
+
+    return SSL_get_version(connection->ssl);
 }
 
-const char* PMS_CALL pms_ssl_get_last_error(void) {
+PMS_EXPORT const char* PMS_CALL
+pms_ssl_get_cipher_name(
+    void* connection_ptr)
+{
+    if (!connection_ptr)
+        return "";
+
+    auto* connection =
+        static_cast<PmsSslConnection*>(connection_ptr);
+
+    const SSL_CIPHER* cipher =
+        SSL_get_current_cipher(connection->ssl);
+
+    if (!cipher)
+        return "";
+
+    return SSL_CIPHER_get_name(cipher);
+}
+
+PMS_EXPORT const char* PMS_CALL
+pms_ssl_get_last_error()
+{
     return g_last_error.c_str();
 }
 
-void PMS_CALL pms_ssl_free(void* ptr) {
-    auto* connection = static_cast<PmsConnection*>(ptr);
-    if (!connection)
+PMS_EXPORT void PMS_CALL pms_ssl_free(
+    void* connection_ptr)
+{
+    if (!connection_ptr)
         return;
 
-    BIO_METHOD* method = connection->bio_method;
+    auto* connection =
+        static_cast<PmsSslConnection*>(connection_ptr);
 
-    if (connection->ssl) {
-        // SSL_free owns and frees the BIO installed with SSL_set_bio().
+    if (connection->ssl)
         SSL_free(connection->ssl);
-        connection->ssl = nullptr;
-        connection->bio = nullptr;
-    }
-
-    // BIO_free does not own/free the BIO_METHOD.
-    if (method)
-        BIO_meth_free(method);
 
     if (connection->ctx)
         SSL_CTX_free(connection->ctx);
 
     delete connection;
+}
+
 }

@@ -1,4 +1,5 @@
 #pragma once
+
 #include <stdint.h>
 
 #ifdef _WIN32
@@ -13,18 +14,51 @@
 extern "C" {
 #endif
 
-typedef int (PMS_CALL *pms_read_callback)(void* user_data, uint8_t* buffer, int length);
-typedef int (PMS_CALL *pms_write_callback)(void* user_data, const uint8_t* buffer, int length);
+#define PMS_SSL_OK           1
+#define PMS_SSL_ZERO_RETURN  0
+#define PMS_SSL_ERROR       -1
+#define PMS_SSL_WANT_READ   -2
+#define PMS_SSL_WANT_WRITE  -3
 
-PMS_EXPORT void* PMS_CALL pms_ssl_create(void* user_data, pms_read_callback read_callback,
-    pms_write_callback write_callback, const char* hostname);
-PMS_EXPORT int PMS_CALL pms_ssl_connect(void* connection);
-PMS_EXPORT int PMS_CALL pms_ssl_read(void* connection, uint8_t* buffer, int offset, int length);
-PMS_EXPORT int PMS_CALL pms_ssl_write(void* connection, const uint8_t* buffer, int offset, int length);
-PMS_EXPORT const char* PMS_CALL pms_ssl_get_protocol_version(void* connection);
-PMS_EXPORT const char* PMS_CALL pms_ssl_get_cipher_name(void* connection);
-PMS_EXPORT const char* PMS_CALL pms_ssl_get_last_error(void);
-PMS_EXPORT void PMS_CALL pms_ssl_free(void* connection);
+PMS_EXPORT void* PMS_CALL pms_ssl_create(
+    const char* hostname);
+
+PMS_EXPORT int PMS_CALL pms_ssl_connect(
+    void* connection);
+
+PMS_EXPORT int PMS_CALL pms_ssl_feed_read(
+    void* connection,
+    const uint8_t* buffer,
+    int length);
+
+PMS_EXPORT int PMS_CALL pms_ssl_take_write(
+    void* connection,
+    uint8_t* buffer,
+    int length);
+
+PMS_EXPORT int PMS_CALL pms_ssl_pending_write(
+    void* connection);
+
+PMS_EXPORT int PMS_CALL pms_ssl_read(
+    void* connection,
+    uint8_t* buffer,
+    int length);
+
+PMS_EXPORT int PMS_CALL pms_ssl_write(
+    void* connection,
+    const uint8_t* buffer,
+    int length);
+
+PMS_EXPORT const char* PMS_CALL pms_ssl_get_protocol_version(
+    void* connection);
+
+PMS_EXPORT const char* PMS_CALL pms_ssl_get_cipher_name(
+    void* connection);
+
+PMS_EXPORT const char* PMS_CALL pms_ssl_get_last_error();
+
+PMS_EXPORT void PMS_CALL pms_ssl_free(
+    void* connection);
 
 #ifdef __cplusplus
 }

@@ -5,7 +5,7 @@ using System.Text;
 
 const string host = "tls.peet.ws";
 //const string host = "kittens.sh";
-const string document = "/api/all";
+const string document = "/api/tls";
 const int port = 443;
 
 using var client = new TcpClient();
@@ -22,7 +22,7 @@ using var sslStream = new BoringSslStream(networkStream, host);
 
 Console.WriteLine("Starting BoringSSL handshake...");
 
-sslStream.AuthenticateAsClient();
+await sslStream.AuthenticateAsClientAsync();
 
 Console.WriteLine($"TLS version: {sslStream.ProtocolVersion}");
 Console.WriteLine($"Cipher:      {sslStream.CipherName}");
@@ -39,10 +39,9 @@ const string request =
 
 var requestBytes = Encoding.ASCII.GetBytes(request);
 
-sslStream.Write(
-    requestBytes,
-    0,
-    requestBytes.Length);
+await sslStream.WriteAsync(
+    requestBytes.AsMemory(
+        0, requestBytes.Length));
 
 const string output_dir = "./output/";
 if (!Directory.Exists(output_dir))
@@ -54,10 +53,12 @@ const string filename = $"{output_dir}{host}.txt";
 
 using var file = File.Create(filename);
 
-var buffer = new byte[16 * 1024];
+const int bufferSize = 16 * 1024;
+
+var buffer = new byte[bufferSize];
 while (true)
 {
-    int read = sslStream.Read(buffer);
+    int read = await sslStream.ReadAsync(buffer.AsMemory(0, bufferSize));
     if (read == 0)
         break;
 

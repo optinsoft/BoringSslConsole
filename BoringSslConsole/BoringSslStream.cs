@@ -1,45 +1,38 @@
+using System.Buffers;
 using System.Runtime.InteropServices;
 
 public sealed class BoringSslStream : Stream
 {
+    private const int NetworkBufferSize = 16 * 1024;
+
     private readonly Stream _innerStream;
-    private readonly GCHandle _streamHandle;
-    private readonly nint _connection;
+    private readonly bool _leaveOpen;
+    private readonly IntPtr _connection;
+
+    // SSL* is not accessed concurrently.
+    private readonly SemaphoreSlim _sslLock = new(1, 1);
+
+    private bool _authenticated;
     private bool _disposed;
 
-    public BoringSslStream(Stream innerStream, string hostname)
+    public BoringSslStream(
+        Stream innerStream,
+        string hostname,
+        bool leaveOpen = false)
     {
+        ArgumentNullException.ThrowIfNull(innerStream);
+        ArgumentException.ThrowIfNullOrWhiteSpace(hostname);
+
         _innerStream = innerStream;
+        _leaveOpen = leaveOpen;
 
-        _streamHandle = GCHandle.Alloc(innerStream);
+        _connection = Native.pms_ssl_create(hostname);
 
-        _connection = NativeMethods.Create(
-            GCHandle.ToIntPtr(_streamHandle),
-            ReadCallback,
-            WriteCallback,
-            hostname);
-
-        if (_connection == 0)
+        if (_connection == IntPtr.Zero)
         {
-            _streamHandle.Free();
-            throw new InvalidOperationException(
-                "Failed to create BoringSSL connection.");
-        }
-    }
-
-    public void AuthenticateAsClient()
-    {
-        ThrowIfDisposed();
-
-        int result = NativeMethods.Connect(_connection);
-
-        if (result != 1)
-        {
-            var error = Marshal.PtrToStringAnsi(
-                NativeMethods.GetLastError());
-
             throw new IOException(
-                $"BoringSSL handshake failed: {error}");
+                $"Failed to create BoringSSL connection: " +
+                $"{GetNativeError()}");
         }
     }
 
@@ -49,9 +42,10 @@ public sealed class BoringSslStream : Stream
         {
             ThrowIfDisposed();
 
-            return Marshal.PtrToStringAnsi(
-                NativeMethods.GetProtocolVersion(_connection))
-                ?? string.Empty;
+            return Marshal.PtrToStringUTF8(
+                       Native.pms_ssl_get_protocol_version(
+                           _connection))
+                   ?? string.Empty;
         }
     }
 
@@ -61,52 +55,394 @@ public sealed class BoringSslStream : Stream
         {
             ThrowIfDisposed();
 
-            return Marshal.PtrToStringAnsi(
-                NativeMethods.GetCipherName(_connection))
-                ?? string.Empty;
+            return Marshal.PtrToStringUTF8(
+                       Native.pms_ssl_get_cipher_name(
+                           _connection))
+                   ?? string.Empty;
         }
     }
 
-    public override int Read(byte[] buffer, int offset, int count)
+    public async ValueTask AuthenticateAsClientAsync(
+        CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
-        return NativeMethods.Read(
-            _connection,
-            buffer,
-            offset,
-            count);
+        await _sslLock.WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        try
+        {
+            if (_authenticated)
+                return;
+
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                int result =
+                    Native.pms_ssl_connect(_connection);
+
+                await FlushWriteBioAsync(
+                        cancellationToken)
+                    .ConfigureAwait(false);
+
+                switch (result)
+                {
+                    case Native.PMS_SSL_OK:
+                        _authenticated = true;
+                        return;
+
+                    case Native.PMS_SSL_WANT_READ:
+                        await ReadFromNetworkAsync(
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        break;
+
+                    case Native.PMS_SSL_WANT_WRITE:
+                        // Output has already been flushed.
+                        break;
+
+                    case Native.PMS_SSL_ZERO_RETURN:
+                        throw new IOException(
+                            "BoringSSL handshake was closed " +
+                            "by the peer.");
+
+                    default:
+                        throw CreateSslException(
+                            "BoringSSL handshake failed");
+                }
+            }
+        }
+        finally
+        {
+            _sslLock.Release();
+        }
     }
 
-    public override void Write(byte[] buffer, int offset, int count)
+    public override async ValueTask<int> ReadAsync(
+        Memory<byte> buffer,
+        CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
-        int written = NativeMethods.Write(
-            _connection,
-            buffer,
-            offset,
-            count);
+        if (buffer.Length == 0)
+            return 0;
 
-        if (written < 0)
+        await _sslLock.WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        try
         {
-            var error = Marshal.PtrToStringAnsi(
-                NativeMethods.GetLastError());
+            EnsureAuthenticated();
 
-            throw new IOException(
-                $"BoringSSL write failed: {error}");
+            using MemoryHandle handle = buffer.Pin();
+
+            IntPtr pointer = GetHandlePointer(handle);
+
+            return await ReadCoreAsync(
+                    pointer,
+                    buffer.Length,
+                    cancellationToken)
+                .ConfigureAwait(false);
         }
-
-        if (written != count)
+        finally
         {
-            throw new IOException(
-                $"BoringSSL wrote only {written} of {count} bytes.");
+            _sslLock.Release();
         }
     }
 
-    public override bool CanRead => true;
-    public override bool CanSeek => false;
-    public override bool CanWrite => true;
+    private async ValueTask<int> ReadCoreAsync(
+        IntPtr buffer,
+        int length,
+        CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            int result = Native.pms_ssl_read(
+                _connection,
+                buffer,
+                length);
+
+            // SSL_read can generate TLS output itself.
+            await FlushWriteBioAsync(
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            switch (result)
+            {
+                case > 0:
+                    return result;
+
+                case Native.PMS_SSL_ZERO_RETURN:
+                    return 0;
+
+                case Native.PMS_SSL_WANT_READ:
+                    await ReadFromNetworkAsync(
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+
+                case Native.PMS_SSL_WANT_WRITE:
+                    // Output was flushed above.
+                    break;
+
+                default:
+                    throw CreateSslException(
+                        "BoringSSL read failed");
+            }
+        }
+    }
+
+    public override async ValueTask WriteAsync(
+        ReadOnlyMemory<byte> buffer,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+
+        if (buffer.Length == 0)
+            return;
+
+        await _sslLock.WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        try
+        {
+            EnsureAuthenticated();
+
+            using MemoryHandle handle = buffer.Pin();
+
+            IntPtr pointer = GetHandlePointer(handle);
+
+            await WriteCoreAsync(
+                    pointer,
+                    buffer.Length,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            _sslLock.Release();
+        }
+    }
+
+    private async ValueTask WriteCoreAsync(
+        IntPtr buffer,
+        int length,
+        CancellationToken cancellationToken)
+    {
+        int offset = 0;
+
+        while (offset < length)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            IntPtr current =
+                IntPtr.Add(buffer, offset);
+
+            int result = Native.pms_ssl_write(
+                _connection,
+                current,
+                length - offset);
+
+            await FlushWriteBioAsync(
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            switch (result)
+            {
+                case > 0:
+                    offset += result;
+                    break;
+
+                case Native.PMS_SSL_WANT_READ:
+                    await ReadFromNetworkAsync(
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+
+                case Native.PMS_SSL_WANT_WRITE:
+                    // Output was flushed above.
+                    break;
+
+                case Native.PMS_SSL_ZERO_RETURN:
+                    throw new IOException(
+                        "BoringSSL connection was closed " +
+                        "by the peer.");
+
+                default:
+                    throw CreateSslException(
+                        "BoringSSL write failed");
+            }
+        }
+    }
+
+    private async ValueTask ReadFromNetworkAsync(
+        CancellationToken cancellationToken)
+    {
+        byte[] buffer =
+            ArrayPool<byte>.Shared.Rent(
+                NetworkBufferSize);
+
+        try
+        {
+            Memory<byte> memory =
+                buffer.AsMemory(
+                    0,
+                    NetworkBufferSize);
+
+            int read = await _innerStream.ReadAsync(
+                    memory,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            if (read == 0)
+            {
+                throw new EndOfStreamException(
+                    "Underlying stream was closed.");
+            }
+
+            using MemoryHandle handle =
+                memory[..read].Pin();
+
+            IntPtr pointer = GetHandlePointer(handle);
+
+            int accepted =
+                Native.pms_ssl_feed_read(
+                    _connection,
+                    pointer,
+                    read);
+
+            if (accepted != read)
+            {
+                throw CreateSslException(
+                    $"BoringSSL accepted {accepted} " +
+                    $"of {read} bytes");
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private async ValueTask FlushWriteBioAsync(
+        CancellationToken cancellationToken)
+    {
+        byte[] buffer =
+            ArrayPool<byte>.Shared.Rent(
+                NetworkBufferSize);
+
+        try
+        {
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                int pending =
+                    Native.pms_ssl_pending_write(
+                        _connection);
+
+                if (pending < 0)
+                {
+                    throw CreateSslException(
+                        "Failed to inspect BoringSSL write BIO");
+                }
+
+                if (pending == 0)
+                    return;
+
+                int size = Math.Min(
+                    pending,
+                    buffer.Length);
+
+                Memory<byte> memory =
+                    buffer.AsMemory(0, size);
+
+                using MemoryHandle handle =
+                    memory.Pin();
+
+                IntPtr pointer = GetHandlePointer(handle);
+
+                int read =
+                    Native.pms_ssl_take_write(
+                        _connection,
+                        pointer,
+                        size);
+
+                if (read < 0)
+                {
+                    throw CreateSslException(
+                        "Failed to read BoringSSL write BIO");
+                }
+
+                if (read == 0)
+                    return;
+
+                await _innerStream.WriteAsync(
+                        memory[..read],
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private void EnsureAuthenticated()
+    {
+        if (!_authenticated)
+        {
+            throw new InvalidOperationException(
+                "Call AuthenticateAsClientAsync() first.");
+        }
+    }
+
+    private IOException CreateSslException(
+        string message)
+    {
+        string error = GetNativeError();
+
+        return new IOException(
+            string.IsNullOrWhiteSpace(error)
+                ? message
+                : $"{message}: {error}");
+    }
+
+    private string GetNativeError()
+    {
+        IntPtr pointer =
+            Native.pms_ssl_get_last_error();
+
+        if (pointer == IntPtr.Zero)
+            return "unknown native error";
+
+        return Marshal.PtrToStringUTF8(pointer)
+            ?? "unknown native error";
+    }
+
+    private void ThrowIfDisposed()
+    {
+        ObjectDisposedException.ThrowIf(
+            _disposed,
+            this);
+    }
+
+    // ------------------------------------------------------------
+    // Stream
+    // ------------------------------------------------------------
+
+    public override bool CanRead =>
+        !_disposed;
+
+    public override bool CanSeek =>
+        false;
+
+    public override bool CanWrite =>
+        !_disposed;
 
     public override long Length =>
         throw new NotSupportedException();
@@ -119,83 +455,143 @@ public sealed class BoringSslStream : Stream
 
     public override void Flush()
     {
-        // Nothing to flush.
+        ThrowIfDisposed();
+
+        FlushAsync(CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
     }
 
-    public override long Seek(long offset, SeekOrigin origin) =>
-        throw new NotSupportedException();
-
-    public override void SetLength(long value) =>
-        throw new NotSupportedException();
-
-    private static int ReadCallback(
-        nint userData,
-        nint buffer,
-        int length)
+    public override Task FlushAsync(
+        CancellationToken cancellationToken)
     {
+        return FlushAsyncCore(
+            cancellationToken);
+    }
+
+    private async Task FlushAsyncCore(
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+
+        await _sslLock.WaitAsync(
+                cancellationToken)
+            .ConfigureAwait(false);
+
         try
         {
-            var handle = GCHandle.FromIntPtr(userData);
-            var stream = (Stream)handle.Target!;
+            await FlushWriteBioAsync(
+                    cancellationToken)
+                .ConfigureAwait(false);
 
-            var managedBuffer = new byte[length];
-
-            int read = stream.Read(
-                managedBuffer,
-                0,
-                managedBuffer.Length);
-
-            if (read > 0)
-            {
-                Marshal.Copy(
-                    managedBuffer,
-                    0,
-                    buffer,
-                    read);
-            }
-
-            return read;
+            await _innerStream.FlushAsync(
+                    cancellationToken)
+                .ConfigureAwait(false);
         }
-        catch
+        finally
         {
-            return -1;
+            _sslLock.Release();
         }
     }
 
-    private static int WriteCallback(
-        nint userData,
-        nint buffer,
-        int length)
+    public override int Read(
+        byte[] buffer,
+        int offset,
+        int count)
     {
-        try
+        ArgumentNullException.ThrowIfNull(buffer);
+
+        ValidateBufferArguments(
+            buffer,
+            offset,
+            count);
+
+        return ReadAsync(
+                buffer.AsMemory(offset, count),
+                CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+    }
+
+    public override Task<int> ReadAsync(
+        byte[] buffer,
+        int offset,
+        int count,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(buffer);
+
+        ValidateBufferArguments(
+            buffer,
+            offset,
+            count);
+
+        return ReadAsync(
+                buffer.AsMemory(offset, count),
+                cancellationToken)
+            .AsTask();
+    }
+
+    public override void Write(
+        byte[] buffer,
+        int offset,
+        int count)
+    {
+        ArgumentNullException.ThrowIfNull(buffer);
+
+        ValidateBufferArguments(
+            buffer,
+            offset,
+            count);
+
+        WriteAsync(
+                buffer.AsMemory(offset, count),
+                CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+    }
+
+    public override Task WriteAsync(
+        byte[] buffer,
+        int offset,
+        int count,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(buffer);
+
+        ValidateBufferArguments(
+            buffer,
+            offset,
+            count);
+
+        return WriteAsync(
+                buffer.AsMemory(offset, count),
+                cancellationToken)
+            .AsTask();
+    }
+
+    private static new void ValidateBufferArguments(
+        byte[] buffer,
+        int offset,
+        int count)
+    {
+        if ((uint)offset > (uint)buffer.Length ||
+            (uint)count > (uint)(buffer.Length - offset))
         {
-            var handle = GCHandle.FromIntPtr(userData);
-            var stream = (Stream)handle.Target!;
-
-            var managedBuffer = new byte[length];
-
-            Marshal.Copy(
-                buffer,
-                managedBuffer,
-                0,
-                length);
-
-            stream.Write(
-                managedBuffer,
-                0,
-                length);
-
-            return length;
-        }
-        catch
-        {
-            return -1;
+            throw new ArgumentOutOfRangeException();
         }
     }
 
-    private void ThrowIfDisposed()
+    public override long Seek(
+        long offset,
+        SeekOrigin origin)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        throw new NotSupportedException();
+    }
+
+    public override void SetLength(long value)
+    {
+        throw new NotSupportedException();
     }
 
     protected override void Dispose(bool disposing)
@@ -205,16 +601,146 @@ public sealed class BoringSslStream : Stream
 
         _disposed = true;
 
-        if (_connection != 0)
-        {
-            NativeMethods.Free(_connection);
-        }
+        Native.pms_ssl_free(
+            _connection);
 
-        if (_streamHandle.IsAllocated)
+        if (disposing)
         {
-            _streamHandle.Free();
+            _sslLock.Dispose();
+
+            if (!_leaveOpen)
+                _innerStream.Dispose();
         }
 
         base.Dispose(disposing);
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+            return;
+
+        _disposed = true;
+
+        Native.pms_ssl_free(
+            _connection);
+
+        _sslLock.Dispose();
+
+        if (!_leaveOpen)
+        {
+            await _innerStream
+                .DisposeAsync()
+                .ConfigureAwait(false);
+        }
+
+        GC.SuppressFinalize(this);
+    }
+
+    // ------------------------------------------------------------
+    // Native API
+    // ------------------------------------------------------------
+
+    private static class Native
+    {
+        internal const int PMS_SSL_OK = 1;
+        internal const int PMS_SSL_ZERO_RETURN = 0;
+        internal const int PMS_SSL_ERROR = -1;
+        internal const int PMS_SSL_WANT_READ = -2;
+        internal const int PMS_SSL_WANT_WRITE = -3;
+
+        [DllImport(
+            "proxymap_boringssl",
+            CallingConvention = CallingConvention.Cdecl,
+            EntryPoint = "pms_ssl_create")]
+        internal static extern IntPtr pms_ssl_create(
+            [MarshalAs(UnmanagedType.LPUTF8Str)]
+            string hostname);
+
+        [DllImport(
+            "proxymap_boringssl",
+            CallingConvention = CallingConvention.Cdecl,
+            EntryPoint = "pms_ssl_connect")]
+        internal static extern int pms_ssl_connect(
+            IntPtr connection);
+
+        [DllImport(
+            "proxymap_boringssl",
+            CallingConvention = CallingConvention.Cdecl,
+            EntryPoint = "pms_ssl_feed_read")]
+        internal static extern int pms_ssl_feed_read(
+            IntPtr connection,
+            IntPtr buffer,
+            int length);
+
+        [DllImport(
+            "proxymap_boringssl",
+            CallingConvention = CallingConvention.Cdecl,
+            EntryPoint = "pms_ssl_take_write")]
+        internal static extern int pms_ssl_take_write(
+            IntPtr connection,
+            IntPtr buffer,
+            int length);
+
+        [DllImport(
+            "proxymap_boringssl",
+            CallingConvention = CallingConvention.Cdecl,
+            EntryPoint = "pms_ssl_pending_write")]
+        internal static extern int pms_ssl_pending_write(
+            IntPtr connection);
+
+        [DllImport(
+            "proxymap_boringssl",
+            CallingConvention = CallingConvention.Cdecl,
+            EntryPoint = "pms_ssl_read")]
+        internal static extern int pms_ssl_read(
+            IntPtr connection,
+            IntPtr buffer,
+            int length);
+
+        [DllImport(
+            "proxymap_boringssl",
+            CallingConvention = CallingConvention.Cdecl,
+            EntryPoint = "pms_ssl_write")]
+        internal static extern int pms_ssl_write(
+            IntPtr connection,
+            IntPtr buffer,
+            int length);
+
+        [DllImport(
+            "proxymap_boringssl",
+            CallingConvention = CallingConvention.Cdecl,
+            EntryPoint = "pms_ssl_get_protocol_version")]
+        internal static extern IntPtr
+            pms_ssl_get_protocol_version(
+                IntPtr connection);
+
+        [DllImport(
+            "proxymap_boringssl",
+            CallingConvention = CallingConvention.Cdecl,
+            EntryPoint = "pms_ssl_get_cipher_name")]
+        internal static extern IntPtr
+            pms_ssl_get_cipher_name(
+                IntPtr connection);
+
+        [DllImport(
+            "proxymap_boringssl",
+            CallingConvention = CallingConvention.Cdecl,
+            EntryPoint = "pms_ssl_get_last_error")]
+        internal static extern IntPtr
+            pms_ssl_get_last_error();
+
+        [DllImport(
+            "proxymap_boringssl",
+            CallingConvention = CallingConvention.Cdecl,
+            EntryPoint = "pms_ssl_free")]
+        internal static extern void pms_ssl_free(
+            IntPtr connection);
+    }
+
+    private static unsafe IntPtr GetHandlePointer(
+        MemoryHandle handle)
+    {
+        return (IntPtr)handle.Pointer;
     }
 }

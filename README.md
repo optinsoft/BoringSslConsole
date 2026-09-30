@@ -1,7 +1,7 @@
 # BoringSslConsole
 
 A deliberately small proof-of-concept console application that connects to
-`https://tls.peet.ws/api/all` using BoringSSL, while BoringSSL reads and
+`https://tls.peet.ws/api/tls` using BoringSSL, while BoringSSL reads and
 writes through a managed .NET `NetworkStream` via a custom BIO.
 
 The purpose of this first version is **not** to imitate Chrome. It is only to
@@ -21,7 +21,7 @@ HTTPS
 
 `TrackMe - fingerprinting API` reports the TLS protocol, cipher suites, extensions,
 JA3 and JA4, so it is useful for comparing the first BoringSSL ClientHello with
-a normal browser later. See https://tls.peet.ws/api/all
+a normal browser later. See https://tls.peet.ws/api/tls
 
 ## Prerequisites (Windows)
 
@@ -82,7 +82,7 @@ The native DLL is copied to the .NET output directory automatically.
 3. Gives BoringSSL a custom BIO.
 4. The BIO callbacks call the managed `NetworkStream`.
 5. Performs `SSL_connect()`.
-6. Sends a simple HTTP/1.1 request for `/api/all`.
+6. Sends a simple HTTP/1.1 request for `/api/tls`.
 7. Prints the HTTP response.
 
 Certificate verification is intentionally disabled in this first experiment.
