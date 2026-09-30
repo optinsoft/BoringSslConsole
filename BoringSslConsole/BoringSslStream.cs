@@ -412,7 +412,7 @@ public sealed class BoringSslStream : Stream
                 : $"{message}: {error}");
     }
 
-    private string GetNativeError()
+    private static string GetNativeError()
     {
         IntPtr pointer =
             Native.pms_ssl_get_last_error();
@@ -506,11 +506,23 @@ public sealed class BoringSslStream : Stream
             offset,
             count);
 
-        return ReadAsync(
-                buffer.AsMemory(offset, count),
-                CancellationToken.None)
-            .GetAwaiter()
-            .GetResult();
+        ValueTask<int> readTask = ReadAsync(
+            buffer.AsMemory(offset, count),
+            CancellationToken.None);
+
+        if (readTask.IsCompleted)
+        {
+            return readTask
+                .GetAwaiter()
+                .GetResult();
+        }
+        else
+        {
+            return readTask
+                .AsTask()
+                .GetAwaiter()
+                .GetResult();
+        }
     }
 
     public override Task<int> ReadAsync(
@@ -544,11 +556,23 @@ public sealed class BoringSslStream : Stream
             offset,
             count);
 
-        WriteAsync(
-                buffer.AsMemory(offset, count),
-                CancellationToken.None)
-            .GetAwaiter()
-            .GetResult();
+        ValueTask writeTask = WriteAsync(
+            buffer.AsMemory(offset, count), 
+            CancellationToken.None);
+
+        if (writeTask.IsCompleted)
+        {
+            writeTask
+                .GetAwaiter()
+                .GetResult();
+        }
+        else
+        {
+            writeTask
+                .AsTask()
+                .GetAwaiter()
+                .GetResult();
+        }
     }
 
     public override Task WriteAsync(
