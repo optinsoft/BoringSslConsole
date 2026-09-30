@@ -856,7 +856,7 @@ public sealed class BoringSslStream : Stream
                 throw new AuthenticationException($"Certificate chain validation failed: {errors}");
             }
 
-            if (!VerifyHost(certificate, hostname))
+            if (!certificate.MatchesHostname(hostname))
             {
                 throw new AuthenticationException($"The hostname '{hostname}' does not match the server certificate.");
             }
@@ -865,13 +865,5 @@ public sealed class BoringSslStream : Stream
         {
             ArrayPool<byte>.Shared.Return(rentBuffer);
         }
-    }
-
-    private static bool VerifyHost(X509Certificate2 cert, string hostname)
-    {
-        return cert.GetNameInfo(X509NameType.DnsName, false)
-                .Equals(hostname, StringComparison.OrdinalIgnoreCase) 
-            || cert.GetNameInfo(X509NameType.SimpleName, false)
-                .Equals(hostname, StringComparison.OrdinalIgnoreCase);
     }
 }

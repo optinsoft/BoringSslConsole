@@ -21,7 +21,7 @@ HTTPS
 
 `TrackMe - fingerprinting API` reports the TLS protocol, cipher suites, extensions,
 JA3 and JA4, so it is useful for comparing the first BoringSSL ClientHello with
-a normal browser later. See https://tls.peet.ws/api/tls
+a normal browser later. See https://tls.peet.ws/
 
 ## Prerequisites (Windows)
 
