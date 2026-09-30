@@ -10,7 +10,11 @@ public sealed class BoringSslStream : Stream
     private readonly IntPtr _connection;
 
     // SSL* is not accessed concurrently.
-    private readonly SemaphoreSlim _sslLock = new(1, 1);
+    private readonly SemaphoreSlim _readLock = new(1, 1);
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+
+     private readonly SemaphoreSlim _networkWriteLock = new(1, 1);
+     private readonly SemaphoreSlim _networkReadLock = new(1, 1);
 
     private bool _authenticated;
     private bool _disposed;
@@ -67,55 +71,66 @@ public sealed class BoringSslStream : Stream
     {
         ThrowIfDisposed();
 
-        await _sslLock.WaitAsync(cancellationToken)
+        await _readLock.WaitAsync(cancellationToken)
             .ConfigureAwait(false);
 
         try
         {
-            if (_authenticated)
-                return;
-
-            while (true)
+            await _writeLock.WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+                
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
 
-                int result =
-                    Native.pms_ssl_connect(_connection);
+                if (_authenticated)
+                    return;
 
-                await FlushWriteBioAsync(
-                        cancellationToken)
-                    .ConfigureAwait(false);
-
-                switch (result)
+                while (true)
                 {
-                    case Native.PMS_SSL_OK:
-                        _authenticated = true;
-                        return;
+                    cancellationToken.ThrowIfCancellationRequested();
 
-                    case Native.PMS_SSL_WANT_READ:
-                        await ReadFromNetworkAsync(
-                                cancellationToken)
-                            .ConfigureAwait(false);
-                        break;
+                    int result =
+                        Native.pms_ssl_connect(_connection);
 
-                    case Native.PMS_SSL_WANT_WRITE:
-                        // Output has already been flushed.
-                        break;
+                    await FlushWriteBioAsync(
+                            cancellationToken)
+                        .ConfigureAwait(false);
 
-                    case Native.PMS_SSL_ZERO_RETURN:
-                        throw new IOException(
-                            "BoringSSL handshake was closed " +
-                            "by the peer.");
+                    switch (result)
+                    {
+                        case Native.PMS_SSL_OK:
+                            _authenticated = true;
+                            return;
 
-                    default:
-                        throw CreateSslException(
-                            "BoringSSL handshake failed");
+                        case Native.PMS_SSL_WANT_READ:
+                            await ReadFromNetworkAsync(
+                                    cancellationToken)
+                                .ConfigureAwait(false);
+                            break;
+
+                        case Native.PMS_SSL_WANT_WRITE:
+                            // Output has already been flushed.
+                            break;
+
+                        case Native.PMS_SSL_ZERO_RETURN:
+                            throw new IOException(
+                                "BoringSSL handshake was closed " +
+                                "by the peer.");
+
+                        default:
+                            throw CreateSslException(
+                                "BoringSSL handshake failed");
+                    }
                 }
+            }
+            finally
+            {
+                _writeLock.Release();
             }
         }
         finally
         {
-            _sslLock.Release();
+            _readLock.Release();
         }
     }
 
@@ -128,7 +143,7 @@ public sealed class BoringSslStream : Stream
         if (buffer.Length == 0)
             return 0;
 
-        await _sslLock.WaitAsync(cancellationToken)
+        await _readLock.WaitAsync(cancellationToken)
             .ConfigureAwait(false);
 
         try
@@ -147,7 +162,7 @@ public sealed class BoringSslStream : Stream
         }
         finally
         {
-            _sslLock.Release();
+            _readLock.Release();
         }
     }
 
@@ -204,7 +219,7 @@ public sealed class BoringSslStream : Stream
         if (buffer.Length == 0)
             return;
 
-        await _sslLock.WaitAsync(cancellationToken)
+        await _writeLock.WaitAsync(cancellationToken)
             .ConfigureAwait(false);
 
         try
@@ -223,7 +238,7 @@ public sealed class BoringSslStream : Stream
         }
         finally
         {
-            _sslLock.Release();
+            _writeLock.Release();
         }
     }
 
@@ -281,6 +296,9 @@ public sealed class BoringSslStream : Stream
     private async ValueTask ReadFromNetworkAsync(
         CancellationToken cancellationToken)
     {
+        await _networkReadLock.WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+
         byte[] buffer =
             ArrayPool<byte>.Shared.Rent(
                 NetworkBufferSize);
@@ -324,12 +342,16 @@ public sealed class BoringSslStream : Stream
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer);
+            _networkReadLock.Release();
         }
     }
 
     private async ValueTask FlushWriteBioAsync(
         CancellationToken cancellationToken)
     {
+        await _networkWriteLock.WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+
         byte[] buffer =
             ArrayPool<byte>.Shared.Rent(
                 NetworkBufferSize);
@@ -389,6 +411,7 @@ public sealed class BoringSslStream : Stream
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer);
+            _networkWriteLock.Release();
         }
     }
 
@@ -474,7 +497,7 @@ public sealed class BoringSslStream : Stream
     {
         ThrowIfDisposed();
 
-        await _sslLock.WaitAsync(
+        await _writeLock.WaitAsync(
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -490,7 +513,7 @@ public sealed class BoringSslStream : Stream
         }
         finally
         {
-            _sslLock.Release();
+            _writeLock.Release();
         }
     }
 
@@ -630,7 +653,10 @@ public sealed class BoringSslStream : Stream
 
         if (disposing)
         {
-            _sslLock.Dispose();
+            _readLock.Dispose();
+            _writeLock.Dispose();
+            _networkWriteLock.Dispose();
+            _networkReadLock.Dispose();
 
             if (!_leaveOpen)
                 _innerStream.Dispose();
@@ -649,7 +675,10 @@ public sealed class BoringSslStream : Stream
         Native.pms_ssl_free(
             _connection);
 
-        _sslLock.Dispose();
+        _readLock.Dispose();
+        _writeLock.Dispose();
+        _networkWriteLock.Dispose();
+        _networkReadLock.Dispose();
 
         if (!_leaveOpen)
         {

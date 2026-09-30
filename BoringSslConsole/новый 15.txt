@@ -1,0 +1,321 @@
+using System.Buffers;
+using System.Runtime.InteropServices;
+
+public sealed class BoringSslStream : Stream
+{
+    private const int NetworkBufferSize = 16 * 1024;
+
+    private readonly Stream _innerStream;
+    private readonly bool _leaveOpen;
+    private readonly IntPtr _connection;
+
+    // РАЗДЕЛЯЕМ ЛОКИ: один для чтения, второй для записи
+    private readonly SemaphoreSlim _readLock = new(1, 1);
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+
+    // Лок для сетевых операций записи, если FlushWriteBioAsync вызывается параллельно из Read и Write
+    private readonly SemaphoreSlim _networkWriteLock = new(1, 1);
+    // Лок для сетевых операций чтения
+    private readonly SemaphoreSlim _networkReadLock = new(1, 1);
+
+    private bool _authenticated;
+    private bool _disposed;
+
+    public BoringSslStream(Stream innerStream, string hostname, bool leaveOpen = false)
+    {
+        ArgumentNullException.ThrowIfNull(innerStream);
+        ArgumentException.ThrowIfNullOrWhiteSpace(hostname);
+
+        _innerStream = innerStream;
+        _leaveOpen = leaveOpen;
+        _connection = Native.pms_ssl_create(hostname);
+
+        if (_connection == IntPtr.Zero)
+        {
+            throw new IOException($"Failed to create BoringSSL connection: {GetNativeError()}");
+        }
+    }
+
+    public string ProtocolVersion
+    {
+        get
+        {
+            ThrowIfDisposed();
+
+            return Marshal.PtrToStringUTF8(
+                       Native.pms_ssl_get_protocol_version(
+                           _connection))
+                   ?? string.Empty;
+        }
+    }
+
+    public string CipherName
+    {
+        get
+        {
+            ThrowIfDisposed();
+
+            return Marshal.PtrToStringUTF8(
+                       Native.pms_ssl_get_cipher_name(
+                           _connection))
+                   ?? string.Empty;
+        }
+    }
+
+    public async ValueTask AuthenticateAsClientAsync(
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+
+        // Во время хендшейка монопольно захватываем ОБА канала
+        await _readLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (_authenticated) return;
+
+                while (true)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    int result = Native.pms_ssl_connect(_connection);
+
+                    await FlushWriteBioAsync(cancellationToken).ConfigureAwait(false);
+
+                    switch (result)
+                    {
+                        case Native.PMS_SSL_OK:
+                            _authenticated = true;
+                            return;
+
+                        case Native.PMS_SSL_WANT_READ:
+                            await ReadFromNetworkAsync(cancellationToken).ConfigureAwait(false);
+                            break;
+
+                        case Native.PMS_SSL_WANT_WRITE:
+                            break;
+
+                        case Native.PMS_SSL_ZERO_RETURN:
+                            throw new IOException("BoringSSL handshake was closed by the peer.");
+
+                        default:
+                            throw CreateSslException("BoringSSL handshake failed");
+                    }
+                }
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+        }
+        finally
+        {
+            _readLock.Release();
+        }
+    }
+
+    public override async ValueTask<int> ReadAsync(
+        Memory<byte> buffer,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (buffer.Length == 0) return 0;
+
+        // Захватываем только лок на чтение
+        await _readLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            EnsureAuthenticated();
+            using MemoryHandle handle = buffer.Pin();
+            IntPtr pointer = GetHandlePointer(handle);
+
+            return await ReadCoreAsync(pointer, buffer.Length, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _readLock.Release();
+        }
+    }
+
+    private async ValueTask<int> ReadCoreAsync(
+        IntPtr buffer,
+        int length,
+        CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int result = Native.pms_ssl_read(_connection, buffer, length);
+
+            // SSL_read может генерировать TLS-вывод (например, ACK-пакеты или алерты)
+            await FlushWriteBioAsync(cancellationToken).ConfigureAwait(false);
+
+            switch (result)
+            {
+                case > 0:
+                    return result;
+
+                case Native.PMS_SSL_ZERO_RETURN:
+                    return 0;
+
+                case Native.PMS_SSL_WANT_READ:
+                    await ReadFromNetworkAsync(cancellationToken).ConfigureAwait(false);
+                    break;
+
+                case Native.PMS_SSL_WANT_WRITE:
+                    break;
+
+                default:
+                    throw CreateSslException("BoringSSL read failed");
+            }
+        }
+    }
+
+    public override async ValueTask WriteAsync(
+        ReadOnlyMemory<byte> buffer,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (buffer.Length == 0) return;
+
+        // Захватываем только лок на запись
+        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            EnsureAuthenticated();
+            using MemoryHandle handle = buffer.Pin();
+            IntPtr pointer = GetHandlePointer(handle);
+
+            await WriteCoreAsync(pointer, buffer.Length, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private async ValueTask WriteCoreAsync(
+        IntPtr buffer,
+        int length,
+        CancellationToken cancellationToken)
+    {
+        int offset = 0;
+        while (offset < length)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            IntPtr current = IntPtr.Add(buffer, offset);
+
+            int result = Native.pms_ssl_write(_connection, current, length - offset);
+
+            await FlushWriteBioAsync(cancellationToken).ConfigureAwait(false);
+
+            switch (result)
+            {
+                case > 0:
+                    offset += result;
+                    break;
+
+                case Native.PMS_SSL_WANT_READ:
+                    // Если при записи TLS потребовал чтение (крайне редко, но возможно в TLS < 1.3)
+                    await ReadFromNetworkAsync(cancellationToken).ConfigureAwait(false);
+                    break;
+
+                case Native.PMS_SSL_WANT_WRITE:
+                    break;
+
+                case Native.PMS_SSL_ZERO_RETURN:
+                    throw new IOException("BoringSSL connection was closed by the peer.");
+
+                    default:
+                        throw CreateSslException("BoringSSL write failed");
+            }
+        }
+    }
+
+    private async ValueTask ReadFromNetworkAsync(
+        CancellationToken cancellationToken)
+    {
+        // Сетевое чтение из _innerStream должно быть атомарным
+        await _networkReadLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(NetworkBufferSize);
+        try
+        {
+            Memory<byte> memory = buffer.AsMemory(0, NetworkBufferSize);
+            int read = await _innerStream.ReadAsync(memory, cancellationToken).ConfigureAwait(false);
+
+            if (read == 0)
+                throw new EndOfStreamException("Underlying stream was closed.");
+
+            using MemoryHandle handle = memory[..read].Pin();
+            IntPtr pointer = GetHandlePointer(handle);
+
+            // Внимание: pms_ssl_feed_read изменяет внутренний read-BIO. 
+            // Благодаря разделению BIO в native-коде это не пересекается с записью.
+            int accepted = Native.pms_ssl_feed_read(_connection, pointer, read);
+            if (accepted != read)
+            {
+                throw CreateSslException($"BoringSSL accepted {accepted} of {read} bytes");
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+            _networkReadLock.Release();
+        }
+    }
+
+    private async ValueTask FlushWriteBioAsync(
+        CancellationToken cancellationToken)
+    {
+        // Так как FlushWriteBioAsync может вызваться параллельно из ReadCoreAsync и WriteCoreAsync,
+        // запись в _innerStream ОБЯЗАТЕЛЬНО должна быть синхронизирована отдельным сетевым локом.
+        await _networkWriteLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(NetworkBufferSize);
+        try
+        {
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                int pending = Native.pms_ssl_pending_write(_connection);
+
+                if (pending < 0) throw CreateSslException("Failed to inspect BoringSSL write BIO");
+                if (pending == 0) return;
+
+                int size = Math.Min(pending, buffer.Length);
+                Memory<byte> memory = buffer.AsMemory(0, size);
+
+                using MemoryHandle handle = memory.Pin();
+                IntPtr pointer = GetHandlePointer(handle);
+
+                int read = Native.pms_ssl_take_write(_connection, pointer, size);
+                if (read < 0) throw CreateSslException("Failed to read BoringSSL write BIO");
+                if (read == 0) return;
+
+                await _innerStream.WriteAsync(memory[..read], cancellationToken).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+            _networkWriteLock.Release();
+        }
+    }
+
+    public override Task FlushAsync(
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await FlushWriteBioAsync(cancellationToken).ConfigureAwait(false);
+            await _innerStream.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+}
