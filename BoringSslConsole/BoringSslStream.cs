@@ -401,7 +401,7 @@ public sealed class BoringSslStream : Stream
         }
     }
 
-    private IOException CreateSslException(
+    private static IOException CreateSslException(
         string message)
     {
         string error = GetNativeError();
