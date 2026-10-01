@@ -7,15 +7,13 @@ The wrapper routes all BoringSSL native read/write operations through a managed 
 ```text
 TcpClient
    |
-NetworkStream
+NetworkStream  (innerStream)
    |
-custom BoringSSL BIO
+BoringSslStream (C#): pumps bytes between the stream and the buffers
    |
-BoringSSL (Thread-Safe Wrappers)
+BoringSSL, memory BIO (pure TLS state, no network)
    |
-HTTP/1.1 or HTTP/2 Protocol Handling
-   |
-HTTPS (Full-Duplex + X509 Validation)
+HTTP/1.1 or HTTP/2
 ```
 
 ## Key Features
