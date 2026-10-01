@@ -5,6 +5,33 @@ using System.Security.Cryptography.X509Certificates;
 
 public sealed class BoringSslStream : Stream
 {
+    private const string ChromeCipherSuitePreset = 
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:" +
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:" +
+        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:" +
+        "ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:" +
+        "AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA";
+    private const int ChromeEnableGreasePreset = 1;
+    private const int ChromeEnableEchGreasePreset = 1;
+    private const string ChromeAlpnPreset = "h2:http/1.1";
+    private const string ChromeAlpsPreset = "h2";
+    private const string ChromeTrustAnchorsPreset = 
+        "0582df1302010582df1302060582df13020d0582df13020e0582df1302" +
+        "0f0582df1302120582df1302130582df13021408839a648c9b2d010708" +
+        "839a648c9b2d010808839a648c9b2d010908839a648c9b2d010a08839a" +
+        "648c9b2d010b08839a648c9b2d010c08839a648c9b2d010d08839a648c" +
+        "9b2d011208839a648c9b2d011304d679090104d679090404d679090504" +
+        "d679090604d679090704d679090804d679090a04d679090b04d679090c" +
+        "04d679090d04d679090f";
+    public const string ChromeSignatureAlgorithmsPreset = 
+        "ML-DSA-44:ML-DSA-65:ML-DSA-87:" +
+        "ECDSA-SECP256R1-SHA256:RSA-PSS-RSAE-SHA256:RSA-PKCS1-SHA256:" +
+        "ECDSA-SECP384R1-SHA384:RSA-PSS-RSAE-SHA384:RSA-PKCS1-SHA384:" +
+        "RSA-PSS-RSAE-SHA512:RSA-PKCS1-SHA512";
+    private const int ChromeEnableSignedCertTimestampsPreset = 1;
+    private const int ChromeSetOcspStatusTypePreset = 1;
+    private const int ChromeEnableBrotliPreset = 1;
+
     private const int NetworkBufferSize = 16 * 1024;
 
     private readonly Stream _innerStream;
@@ -34,7 +61,18 @@ public sealed class BoringSslStream : Stream
         _hostname = hostname;
         _leaveOpen = leaveOpen;
 
-        _connection = Native.pms_ssl_create(hostname);
+        _connection = Native.pms_ssl_create(
+            hostname,
+            ChromeCipherSuitePreset,
+            ChromeEnableGreasePreset,
+            ChromeEnableEchGreasePreset,
+            ChromeAlpnPreset,
+            ChromeAlpsPreset,
+            ChromeTrustAnchorsPreset,
+            ChromeSignatureAlgorithmsPreset,
+            ChromeEnableSignedCertTimestampsPreset,
+            ChromeSetOcspStatusTypePreset,
+            ChromeEnableBrotliPreset);
 
         if (_connection == IntPtr.Zero)
         {
@@ -718,8 +756,17 @@ public sealed class BoringSslStream : Stream
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_create")]
         internal static extern IntPtr pms_ssl_create(
-            [MarshalAs(UnmanagedType.LPUTF8Str)]
-            string hostname);
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string hostname,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string cipherList,
+            int enableGrease,
+            int enableEchGrease,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string alpnProtos,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string alpsProtos,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string trustAnchors,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string sigAlgs,
+            int enableSignedCertTimestamps,
+            int setOcspStatusType,
+            int enableBrotli);
 
         [DllImport(
             "proxymap_boringssl",
@@ -776,14 +823,14 @@ public sealed class BoringSslStream : Stream
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_get_protocol_version")]
         internal static extern IntPtr pms_ssl_get_protocol_version(
-                IntPtr connection);
+            IntPtr connection);
 
         [DllImport(
             "proxymap_boringssl",
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_get_cipher_name")]
         internal static extern IntPtr pms_ssl_get_cipher_name(
-                IntPtr connection);
+            IntPtr connection);
 
         [DllImport(
             "proxymap_boringssl",

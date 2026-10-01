@@ -21,7 +21,17 @@ extern "C" {
 #define PMS_SSL_WANT_WRITE  -3
 
 PMS_EXPORT void* PMS_CALL pms_ssl_create(
-    const char* hostname);
+    const char* hostname,
+    const char* cipher_list,
+    int enable_grease,
+    int enable_ech_grease,
+    const char* alpn_protos,
+    const char* alps_protos,
+    const char* trust_anchors,
+    const char* sig_algs,
+    int enable_signed_cert_timestamps,
+    int set_ocsp_status_type,
+    int enable_brotli);
 
 PMS_EXPORT int PMS_CALL pms_ssl_connect(
     void* connection);
