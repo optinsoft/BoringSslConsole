@@ -54,7 +54,7 @@ BoringSslConsole/
 To clone this repository along with the BoringSSL dependency, run:
 
 ```powershell
-git clone --recursive <BoringSslConsole-Repository-Url>
+git clone --recursive https://github.com/optinsoft/BoringSslConsole.git
 ```
 
 The project builds its own copy of BoringSSL and links the Brotli decoder/encoder components statically into a single, fully autonomous `proxymap_boringssl.dll` to prevent runtime `DllNotFoundException` errors.
