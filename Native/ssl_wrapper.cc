@@ -679,6 +679,36 @@ pms_ssl_get_cipher_name(
     return SSL_CIPHER_get_name(cipher);
 }
 
+PMS_EXPORT const char* PMS_CALL 
+pms_ssl_get_alpn_selected(
+    void* connection_ptr)
+{
+    if (!connection_ptr)
+        return "";
+
+    auto* connection = 
+        static_cast<PmsSslConnection*>(connection_ptr);
+
+    const uint8_t* alpn_proto = nullptr;
+    unsigned alpn_len = 0;
+
+    // OpenSSL/BoringSSL native call to inspect the negotiated ALPN wire-string
+    SSL_get0_alpn_selected(connection->ssl, &alpn_proto, &alpn_len);
+
+    if (alpn_proto && alpn_len > 0)
+    {
+        // Thread-local error string can be repurposed or we can return a static/temporary copy.
+        // For absolute safety across P/Invoke, we can return a null-terminated slice 
+        // since PtrToStringAnsi handles bounded marshaling, but here we can just safely 
+        // map it to g_last_error to keep it alive or create a small buffer.
+        static thread_local std::string g_alpn_buffer;
+        g_alpn_buffer = std::string(reinterpret_cast<const char*>(alpn_proto), alpn_len);
+        return g_alpn_buffer.c_str();
+    }
+
+    return "";
+}
+
 PMS_EXPORT const char* PMS_CALL
 pms_ssl_get_last_error()
 {

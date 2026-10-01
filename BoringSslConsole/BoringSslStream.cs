@@ -52,6 +52,16 @@ public sealed class BoringSslStream : Stream
     public BoringSslStream(
         Stream innerStream,
         string hostname,
+        string cipherList = ChromeCipherSuitePreset,
+        int enableGrease = ChromeEnableGreasePreset,
+        int enableEchGrease = ChromeEnableEchGreasePreset,        
+        string alpnProtos = ChromeAlpnPreset,
+        string alpsProtos = ChromeAlpsPreset,
+        string trustAnchors = ChromeTrustAnchorsPreset,
+        string sigAlgs = ChromeSignatureAlgorithmsPreset,
+        int enableSignedCertTimestamps = ChromeEnableSignedCertTimestampsPreset,
+        int setOcspStatusType = ChromeSetOcspStatusTypePreset,
+        int enableBrotli = ChromeEnableBrotliPreset,
         bool leaveOpen = false)
     {
         ArgumentNullException.ThrowIfNull(innerStream);
@@ -63,16 +73,16 @@ public sealed class BoringSslStream : Stream
 
         _connection = Native.pms_ssl_create(
             hostname,
-            ChromeCipherSuitePreset,
-            ChromeEnableGreasePreset,
-            ChromeEnableEchGreasePreset,
-            ChromeAlpnPreset,
-            ChromeAlpsPreset,
-            ChromeTrustAnchorsPreset,
-            ChromeSignatureAlgorithmsPreset,
-            ChromeEnableSignedCertTimestampsPreset,
-            ChromeSetOcspStatusTypePreset,
-            ChromeEnableBrotliPreset);
+            cipherList,
+            enableGrease,
+            enableEchGrease,
+            alpnProtos,
+            alpsProtos,
+            trustAnchors,
+            sigAlgs,
+            enableSignedCertTimestamps,
+            setOcspStatusType,
+            enableBrotli);
 
         if (_connection == IntPtr.Zero)
         {
@@ -104,6 +114,19 @@ public sealed class BoringSslStream : Stream
             return Marshal.PtrToStringUTF8(
                        Native.pms_ssl_get_cipher_name(
                            _connection))
+                   ?? string.Empty;
+        }
+    }
+
+    public string AlpnSelected
+    {
+        get
+        {
+            ThrowIfDisposed();
+
+            return Marshal.PtrToStringAnsi(
+                       Native.pms_ssl_get_alpn_selected(
+                           _connection)) 
                    ?? string.Empty;
         }
     }
@@ -830,6 +853,13 @@ public sealed class BoringSslStream : Stream
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_get_cipher_name")]
         internal static extern IntPtr pms_ssl_get_cipher_name(
+            IntPtr connection);
+
+        [DllImport(
+            "proxymap_boringssl",
+            CallingConvention = CallingConvention.Cdecl,
+            EntryPoint = "pms_ssl_get_alpn_selected")]
+        internal static extern IntPtr pms_ssl_get_alpn_selected(
             IntPtr connection);
 
         [DllImport(

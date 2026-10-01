@@ -65,6 +65,9 @@ PMS_EXPORT const char* PMS_CALL pms_ssl_get_protocol_version(
 PMS_EXPORT const char* PMS_CALL pms_ssl_get_cipher_name(
     void* connection);
 
+PMS_EXPORT const char* PMS_CALL pms_ssl_get_alpn_selected(
+    void* connection_ptr);
+    
 PMS_EXPORT const char* PMS_CALL pms_ssl_get_last_error();
 
 PMS_EXPORT void PMS_CALL pms_ssl_free(
