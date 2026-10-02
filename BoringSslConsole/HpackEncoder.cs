@@ -1,3 +1,5 @@
+namespace BoringSslConsole;
+
 using System.Text;
 
 public sealed class HpackEncoder

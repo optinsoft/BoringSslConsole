@@ -1,3 +1,5 @@
+namespace BoringSslConsole;
+
 using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Security.Authentication;

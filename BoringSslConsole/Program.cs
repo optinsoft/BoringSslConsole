@@ -3,6 +3,8 @@ using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 
+using BoringSslConsole;
+
 const string host = "tls.peet.ws";
 //const string host = "kittens.sh";
 //const string host = "google.com";
