@@ -51,6 +51,13 @@ public sealed class BoringSslStream : Stream
     private bool _authenticated;
     private bool _disposed;
 
+    /// <summary>
+    /// Optional replacement for the built-in server certificate validation
+    /// (X509Chain + hostname match). Intended for tests that use self-signed
+    /// certificates. Leave null in production code.
+    /// </summary>
+    public Func<X509Certificate2, bool>? RemoteCertificateValidationCallback { get; set; }
+
     public BoringSslStream(
         Stream innerStream,
         string hostname,
@@ -922,6 +929,16 @@ public sealed class BoringSslStream : Stream
             }
 
             using var certificate = new X509Certificate2(memory.Span);
+
+            if (RemoteCertificateValidationCallback is { } validate)
+            {
+                if (!validate(certificate))
+                {
+                    throw new AuthenticationException(
+                        "The server certificate was rejected by RemoteCertificateValidationCallback.");
+                }
+                return;
+            }
 
             using var chain = new X509Chain();
             chain.ChainPolicy.RevocationMode = X509RevocationMode.Online;
