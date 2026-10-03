@@ -4,6 +4,7 @@ using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
+using Microsoft.Win32.SafeHandles;
 
 public sealed class BoringSslStream : Stream
 {
@@ -39,14 +40,16 @@ public sealed class BoringSslStream : Stream
     private readonly Stream _innerStream;
     private readonly string _hostname;
     private readonly bool _leaveOpen;
-    private readonly IntPtr _connection;
+    private readonly Native.SslHandle _connection = new();
 
     // SSL* is not accessed concurrently.
-    private readonly SemaphoreSlim _readLock = new(1, 1);
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
+//    private readonly SemaphoreSlim _readLock = new(1, 1);
+//    private readonly SemaphoreSlim _writeLock = new(1, 1);
 
-     private readonly SemaphoreSlim _networkWriteLock = new(1, 1);
-     private readonly SemaphoreSlim _networkReadLock = new(1, 1);
+    private readonly SemaphoreSlim _nativeLock = new(1, 1);
+
+    private readonly SemaphoreSlim _networkWriteLock = new(1, 1);
+//     private readonly SemaphoreSlim _networkReadLock = new(1, 1);
 
     private bool _authenticated;
     private bool _disposed;
@@ -80,7 +83,7 @@ public sealed class BoringSslStream : Stream
         _hostname = hostname;
         _leaveOpen = leaveOpen;
 
-        _connection = Native.pms_ssl_create(
+        var connection = Native.pms_ssl_create(
             hostname,
             cipherList,
             enableGrease,
@@ -93,12 +96,14 @@ public sealed class BoringSslStream : Stream
             setOcspStatusType,
             enableBrotli);
 
-        if (_connection == IntPtr.Zero)
+        if (connection == IntPtr.Zero)
         {
             throw new IOException(
                 $"Failed to create BoringSSL connection: " +
                 $"{GetNativeError()}");
         }
+
+        Marshal.InitHandle(_connection, connection);
     }
 
     public string ProtocolVersion
@@ -145,13 +150,13 @@ public sealed class BoringSslStream : Stream
     {
         ThrowIfDisposed();
 
-        await _readLock.WaitAsync(cancellationToken)
-            .ConfigureAwait(false);
+//        await _readLock.WaitAsync(cancellationToken)
+//            .ConfigureAwait(false);
 
         try
         {
-            await _writeLock.WaitAsync(cancellationToken)
-                .ConfigureAwait(false);
+//            await _writeLock.WaitAsync(cancellationToken)
+//                .ConfigureAwait(false);
                 
             try
             {
@@ -200,12 +205,12 @@ public sealed class BoringSslStream : Stream
             }
             finally
             {
-                _writeLock.Release();
+//                _writeLock.Release();
             }
         }
         finally
         {
-            _readLock.Release();
+//            _readLock.Release();
         }
     }
 
@@ -218,8 +223,8 @@ public sealed class BoringSslStream : Stream
         if (buffer.Length == 0)
             return 0;
 
-        await _readLock.WaitAsync(cancellationToken)
-            .ConfigureAwait(false);
+//        await _readLock.WaitAsync(cancellationToken)
+//            .ConfigureAwait(false);
 
         try
         {
@@ -237,7 +242,7 @@ public sealed class BoringSslStream : Stream
         }
         finally
         {
-            _readLock.Release();
+//            _readLock.Release();
         }
     }
 
@@ -249,11 +254,21 @@ public sealed class BoringSslStream : Stream
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            int result;
 
-            int result = Native.pms_ssl_read(
-                _connection,
-                buffer,
-                length);
+            await _nativeLock.WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+            try
+            {
+                result = Native.pms_ssl_read(
+                    _connection,
+                    buffer,
+                    length);
+            }
+            finally
+            {
+                _nativeLock.Release();
+            }
 
             // SSL_read can generate TLS output itself.
             await FlushWriteBioAsync(
@@ -294,8 +309,8 @@ public sealed class BoringSslStream : Stream
         if (buffer.Length == 0)
             return;
 
-        await _writeLock.WaitAsync(cancellationToken)
-            .ConfigureAwait(false);
+//        await _writeLock.WaitAsync(cancellationToken)
+//            .ConfigureAwait(false);
 
         try
         {
@@ -313,7 +328,7 @@ public sealed class BoringSslStream : Stream
         }
         finally
         {
-            _writeLock.Release();
+//            _writeLock.Release();
         }
     }
 
@@ -328,13 +343,23 @@ public sealed class BoringSslStream : Stream
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            IntPtr current =
-                IntPtr.Add(buffer, offset);
+            IntPtr current = IntPtr.Add(buffer, offset);
 
-            int result = Native.pms_ssl_write(
-                _connection,
-                current,
-                length - offset);
+            int result;
+
+            await _nativeLock.WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+            try
+            {
+                result = Native.pms_ssl_write(
+                    _connection,
+                    current,
+                    length - offset);
+            }
+            finally
+            {
+                _nativeLock.Release();
+            }
 
             await FlushWriteBioAsync(
                     cancellationToken)
@@ -371,8 +396,8 @@ public sealed class BoringSslStream : Stream
     private async ValueTask ReadFromNetworkAsync(
         CancellationToken cancellationToken)
     {
-        await _networkReadLock.WaitAsync(cancellationToken)
-            .ConfigureAwait(false);
+//        await _networkReadLock.WaitAsync(cancellationToken)
+//            .ConfigureAwait(false);
 
         byte[] buffer =
             ArrayPool<byte>.Shared.Rent(
@@ -400,12 +425,22 @@ public sealed class BoringSslStream : Stream
                 memory[..read].Pin();
 
             IntPtr pointer = GetHandlePointer(handle);
+            int accepted;
 
-            int accepted =
-                Native.pms_ssl_feed_read(
-                    _connection,
-                    pointer,
-                    read);
+            await _nativeLock.WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+            try
+            {
+                accepted =
+                    Native.pms_ssl_feed_read(
+                        _connection,
+                        pointer,
+                        read);
+            }
+            finally
+            {
+                _nativeLock.Release();
+            }
 
             if (accepted != read)
             {
@@ -417,13 +452,40 @@ public sealed class BoringSslStream : Stream
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer);
-            _networkReadLock.Release();
+//            _networkReadLock.Release();
         }
     }
 
     private async ValueTask FlushWriteBioAsync(
         CancellationToken cancellationToken)
     {
+        // Fast path: do NOT take the network lock if there is nothing to send.
+        // ReadCoreAsync calls this after every SSL_read; if it blocked here
+        // behind a writer stuck in a TCP send (peer is not reading because
+        // we are not reading), we would deadlock.
+        int initialPending;
+
+        await _nativeLock.WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+        try
+        {
+            initialPending =
+                Native.pms_ssl_pending_write(_connection);
+        }
+        finally
+        {
+            _nativeLock.Release();
+        }
+
+        if (initialPending < 0)
+        {
+            throw CreateSslException(
+                "Failed to inspect BoringSSL write BIO");
+        }
+
+        if (initialPending == 0)
+            return;
+
         await _networkWriteLock.WaitAsync(cancellationToken)
             .ConfigureAwait(false);
 
@@ -436,10 +498,20 @@ public sealed class BoringSslStream : Stream
             while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                int pending;
 
-                int pending =
-                    Native.pms_ssl_pending_write(
-                        _connection);
+                await _nativeLock.WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                try
+                {
+                    pending =
+                        Native.pms_ssl_pending_write(
+                            _connection);
+                }
+                finally
+                {
+                    _nativeLock.Release();
+                }
 
                 if (pending < 0)
                 {
@@ -461,12 +533,22 @@ public sealed class BoringSslStream : Stream
                     memory.Pin();
 
                 IntPtr pointer = GetHandlePointer(handle);
-
-                int read =
-                    Native.pms_ssl_take_write(
-                        _connection,
-                        pointer,
-                        size);
+                int read;
+                
+                await _nativeLock.WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                try
+                {
+                    read =
+                        Native.pms_ssl_take_write(
+                            _connection,
+                            pointer,
+                            size);
+                }
+                finally
+                {
+                    _nativeLock.Release();
+                }
 
                 if (read < 0)
                 {
@@ -578,9 +660,8 @@ public sealed class BoringSslStream : Stream
     {
         ThrowIfDisposed();
 
-        await _writeLock.WaitAsync(
-                cancellationToken)
-            .ConfigureAwait(false);
+//        await _writeLock.WaitAsync(cancellationToken)
+//            .ConfigureAwait(false);
 
         try
         {
@@ -594,7 +675,7 @@ public sealed class BoringSslStream : Stream
         }
         finally
         {
-            _writeLock.Release();
+//            _writeLock.Release();
         }
     }
 
@@ -729,15 +810,13 @@ public sealed class BoringSslStream : Stream
 
         _disposed = true;
 
-        Native.pms_ssl_free(
-            _connection);
-
         if (disposing)
         {
-            _readLock.Dispose();
-            _writeLock.Dispose();
+//            _readLock.Dispose();
+//            _writeLock.Dispose();
+            _nativeLock.Dispose();
             _networkWriteLock.Dispose();
-            _networkReadLock.Dispose();
+//            _networkReadLock.Dispose();
 
             if (!_leaveOpen)
                 _innerStream.Dispose();
@@ -753,13 +832,11 @@ public sealed class BoringSslStream : Stream
 
         _disposed = true;
 
-        Native.pms_ssl_free(
-            _connection);
-
-        _readLock.Dispose();
-        _writeLock.Dispose();
+//        _readLock.Dispose();
+//        _writeLock.Dispose();
+        _nativeLock.Dispose();        
         _networkWriteLock.Dispose();
-        _networkReadLock.Dispose();
+//        _networkReadLock.Dispose();
 
         if (!_leaveOpen)
         {
@@ -783,6 +860,12 @@ public sealed class BoringSslStream : Stream
         internal const int PMS_SSL_WANT_READ = -2;
         internal const int PMS_SSL_WANT_WRITE = -3;
 
+        public sealed class SslHandle : SafeHandleZeroOrMinusOneIsInvalid
+        {
+            public SslHandle() : base(ownsHandle: true) { }
+            protected override bool ReleaseHandle() { Native.pms_ssl_free(handle); return true; }
+        }
+
         [DllImport(
             "proxymap_boringssl",
             CallingConvention = CallingConvention.Cdecl,
@@ -805,14 +888,14 @@ public sealed class BoringSslStream : Stream
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_connect")]
         internal static extern int pms_ssl_connect(
-            IntPtr connection);
+            SslHandle connection);
 
         [DllImport(
             "proxymap_boringssl",
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_feed_read")]
         internal static extern int pms_ssl_feed_read(
-            IntPtr connection,
+            SslHandle connection,
             IntPtr buffer,
             int length);
 
@@ -821,7 +904,7 @@ public sealed class BoringSslStream : Stream
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_take_write")]
         internal static extern int pms_ssl_take_write(
-            IntPtr connection,
+            SslHandle connection,
             IntPtr buffer,
             int length);
 
@@ -830,14 +913,14 @@ public sealed class BoringSslStream : Stream
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_pending_write")]
         internal static extern int pms_ssl_pending_write(
-            IntPtr connection);
+            SslHandle connection);
 
         [DllImport(
             "proxymap_boringssl",
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_read")]
         internal static extern int pms_ssl_read(
-            IntPtr connection,
+            SslHandle connection,
             IntPtr buffer,
             int length);
 
@@ -846,7 +929,7 @@ public sealed class BoringSslStream : Stream
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_write")]
         internal static extern int pms_ssl_write(
-            IntPtr connection,
+            SslHandle connection,
             IntPtr buffer,
             int length);
 
@@ -855,21 +938,21 @@ public sealed class BoringSslStream : Stream
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_get_protocol_version")]
         internal static extern IntPtr pms_ssl_get_protocol_version(
-            IntPtr connection);
+            SslHandle connection);
 
         [DllImport(
             "proxymap_boringssl",
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_get_cipher_name")]
         internal static extern IntPtr pms_ssl_get_cipher_name(
-            IntPtr connection);
+            SslHandle connection);
 
         [DllImport(
             "proxymap_boringssl",
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_get_alpn_selected")]
         internal static extern IntPtr pms_ssl_get_alpn_selected(
-            IntPtr connection);
+            SslHandle connection);
 
         [DllImport(
             "proxymap_boringssl",
@@ -889,7 +972,7 @@ public sealed class BoringSslStream : Stream
             CallingConvention = CallingConvention.Cdecl,
             EntryPoint = "pms_ssl_get_peer_certificate")]
         internal static extern int pms_ssl_get_peer_certificate(
-            IntPtr connection,
+            SslHandle connection,
             IntPtr buffer,
             int maxLength);
     }

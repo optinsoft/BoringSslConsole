@@ -548,13 +548,14 @@ PMS_EXPORT int PMS_CALL pms_ssl_take_write(
         buffer,
         length);
 
-    if (result < 0)
-    {
-        SetOpenSslError("BIO_read failed");
-        return PMS_SSL_ERROR;
-    }
+    if (result >= 0)
+        return result;
 
-    return result;
+    if (BIO_should_retry(bio))
+        return 0;
+
+    SetOpenSslError("BIO_read failed");
+    return PMS_SSL_ERROR;
 }
 
 PMS_EXPORT int PMS_CALL pms_ssl_pending_write(

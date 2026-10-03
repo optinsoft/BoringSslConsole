@@ -31,7 +31,7 @@ public sealed class BoringSslStreamTests
         int port =
             ((IPEndPoint)listener.LocalEndpoint).Port;
 
-        const int totalBytes = 64 * 1024;
+        const int totalBytes = 64 * 1024 * 1024;
 
         try
         {
@@ -255,11 +255,18 @@ public sealed class BoringSslStreamTests
 
         int offset = 0;
 
+        int chunkNum = 0;
+
         while (offset < data.Length)
         {
             int count = Math.Min(
                 chunkSize,
                 data.Length - offset);
+
+            chunkNum += 1;
+
+            Console.WriteLine(
+                $"CLIENT WRITING: {count}, chunk={chunkNum}...");
 
             await stream.WriteAsync(
                 data.AsMemory(offset, count),
@@ -268,7 +275,7 @@ public sealed class BoringSslStreamTests
             offset += count;
 
             Console.WriteLine(
-                $"CLIENT WRITE: {count}, total={offset}");
+                $"CLIENT WROTE: {count}, total={offset}");            
         }
 
         Console.WriteLine("CLIENT WRITE DONE");
@@ -360,7 +367,7 @@ public sealed class BoringSslStreamTests
             totalWritten += read;
 
             Console.WriteLine(
-                $"SERVER WRITE: {read}, total={totalWritten}");
+                $"SERVER WROTE: {read}, total={totalWritten}");
         }
 
         await sslStream.FlushAsync(cancellationToken);
