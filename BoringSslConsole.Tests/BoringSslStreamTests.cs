@@ -14,6 +14,8 @@ public sealed class BoringSslStreamTests
 {
     private const string Host = "localhost";
 
+    const int batches = 2;
+
     [Fact]
     public async Task ConcurrentReadAndWrite_ShouldWork()
     {
@@ -38,7 +40,7 @@ public sealed class BoringSslStreamTests
             Task serverTask = RunEchoServerAsync(
                 listener,
                 certificate,
-                totalBytes,
+                totalBytes * batches,
                 timeout.Token);
 
             using var client = new TcpClient();
@@ -253,32 +255,35 @@ public sealed class BoringSslStreamTests
     {
         const int chunkSize = 8192;
 
-        int offset = 0;
-
-        int chunkNum = 0;
-
-        while (offset < data.Length)
+        for (int batchNum = 0; batchNum < batches; ++batchNum)
         {
-            int count = Math.Min(
-                chunkSize,
-                data.Length - offset);
+            int offset = 0;
 
-            chunkNum += 1;
+            int chunkNum = 0;
 
-            Console.WriteLine(
-                $"CLIENT WRITING: {count}, chunk={chunkNum}...");
+            while (offset < data.Length)
+            {
+                int count = Math.Min(
+                    chunkSize,
+                    data.Length - offset);
 
-            await stream.WriteAsync(
-                data.AsMemory(offset, count),
-                cancellationToken);
+                chunkNum += 1;
 
-            offset += count;
+                Console.WriteLine(
+                    $"CLIENT WRITING: {count}, chunk={chunkNum}, batch={batchNum}...");
 
-            Console.WriteLine(
-                $"CLIENT WROTE: {count}, total={offset}");            
+                await stream.WriteAsync(
+                    data.AsMemory(offset, count),
+                    cancellationToken);
+
+                offset += count;
+
+                Console.WriteLine(
+                    $"CLIENT WROTE: {count}, total={offset}, batch={batchNum}");
+            }
+
+            Console.WriteLine($"CLIENT WRITE DONE, batch={batchNum}");
         }
-
-        Console.WriteLine("CLIENT WRITE DONE");
     }
 
     private static async Task ResponseTunnelAsync(
@@ -286,24 +291,27 @@ public sealed class BoringSslStreamTests
         byte[] buffer,
         CancellationToken cancellationToken)
     {
-        int offset = 0;
-
-        while (offset < buffer.Length)
+        for (int batchNum = 0; batchNum < batches; ++batchNum)
         {
-            int read = await stream.ReadAsync(
-                buffer.AsMemory(offset),
-                cancellationToken);
+            int offset = 0;
 
-            if (read == 0)
-                throw new EndOfStreamException();
+            while (offset < buffer.Length)
+            {
+                int read = await stream.ReadAsync(
+                    buffer.AsMemory(offset),
+                    cancellationToken);
 
-            offset += read;
+                if (read == 0)
+                    throw new EndOfStreamException();
 
-            Console.WriteLine(
-                $"CLIENT READ: {read}, total={offset}");
+                offset += read;
+
+                Console.WriteLine(
+                    $"CLIENT READ: {read}, total={offset}, batch={batchNum}");
+            }
+
+            Console.WriteLine($"CLIENT READ DONE, batch={batchNum}");
         }
-
-        Console.WriteLine("CLIENT READ DONE");
     }
 
     private static async Task RunEchoServerAsync(
