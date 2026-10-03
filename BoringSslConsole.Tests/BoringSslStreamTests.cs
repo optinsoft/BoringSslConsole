@@ -17,6 +17,93 @@ public sealed class BoringSslStreamTests
     const int batches = 2;
 
     [Fact]
+    public async Task ReadWriteChunks_ShouldEchoData()
+    {
+        using var timeout =
+            new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        using var certificate = CreateCertificate();
+
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        const int chunkSize = 8192;
+        const int chunkCount = 10;
+
+        int totalBytes = chunkSize * chunkCount;
+
+        try
+        {
+            Task serverTask = RunEchoServerAsync(
+                listener,
+                certificate,
+                totalBytes,
+                timeout.Token);
+
+            using var client = new TcpClient();
+
+            await client.ConnectAsync(
+                IPAddress.Loopback,
+                port,
+                timeout.Token);
+
+            await using var networkStream = client.GetStream();
+
+            using var sslStream = new BoringSslStream(
+                networkStream,
+                Host,
+                leaveOpen: true)
+            {
+                RemoteCertificateValidationCallback = _ => true
+            };
+
+            await sslStream.AuthenticateAsClientAsync(timeout.Token);
+
+            byte[] data = new byte[chunkSize * chunkCount];
+            RandomNumberGenerator.Fill(data);
+
+            byte[] received = new byte[chunkSize];
+
+            for (int offset = 0; offset < data.Length; offset += chunkSize)
+            {
+                int count = Math.Min(chunkSize, data.Length - offset);
+
+                await sslStream.WriteAsync(
+                    data.AsMemory(offset, count),
+                    timeout.Token);
+
+                int totalRead = 0;
+
+                while (totalRead < count)
+                {
+                    int read = await sslStream.ReadAsync(
+                        received.AsMemory(totalRead, count - totalRead),
+                        timeout.Token);
+
+                    if (read == 0)
+                        throw new EndOfStreamException(
+                            "Server closed the connection unexpectedly.");
+
+                    totalRead += read;
+                }
+
+                Assert.Equal(
+                    data.AsSpan(offset, count).ToArray(),
+                    received.AsSpan(0, count).ToArray());
+            }
+
+            await sslStream.FlushAsync(timeout.Token);
+            await serverTask.WaitAsync(timeout.Token);
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    [Fact]
     public async Task ConcurrentReadAndWrite_ShouldWork()
     {
         using var timeout =
