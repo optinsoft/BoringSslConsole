@@ -47,7 +47,11 @@ public sealed class BoringSslStream : Stream
     private readonly SemaphoreSlim _readLock = new(1, 1);
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
-    private readonly SemaphoreSlim _nativeLock = new(1, 1);
+    // SSL* is not thread-safe. Every native call is short and non-blocking
+    // (memory BIOs only), so a plain monitor is enough. Never await inside it.
+    // It also keeps the thread-local native error valid: the call and
+    // GetNativeError() happen on the same thread with no await in between.
+    private readonly object _nativeSync = new();
 
 
     // ---- Write pump -------------------------------------------------
@@ -132,10 +136,13 @@ public sealed class BoringSslStream : Stream
         {
             ThrowIfDisposed();
 
-            return Marshal.PtrToStringUTF8(
-                       Native.pms_ssl_get_protocol_version(
-                           _connection))
-                   ?? string.Empty;
+            lock (_nativeSync)
+            {
+                return Marshal.PtrToStringUTF8(
+                           Native.pms_ssl_get_protocol_version(
+                               _connection))
+                       ?? string.Empty;
+            }
         }
     }
 
@@ -145,10 +152,13 @@ public sealed class BoringSslStream : Stream
         {
             ThrowIfDisposed();
 
-            return Marshal.PtrToStringUTF8(
-                       Native.pms_ssl_get_cipher_name(
-                           _connection))
-                   ?? string.Empty;
+            lock (_nativeSync)
+            {
+                return Marshal.PtrToStringUTF8(
+                           Native.pms_ssl_get_cipher_name(
+                               _connection))
+                       ?? string.Empty;
+            }
         }
     }
 
@@ -158,10 +168,13 @@ public sealed class BoringSslStream : Stream
         {
             ThrowIfDisposed();
 
-            return Marshal.PtrToStringAnsi(
-                       Native.pms_ssl_get_alpn_selected(
-                           _connection)) 
-                   ?? string.Empty;
+            lock (_nativeSync)
+            {
+                return Marshal.PtrToStringAnsi(
+                           Native.pms_ssl_get_alpn_selected(
+                               _connection))
+                       ?? string.Empty;
+            }
         }
     }
 
@@ -190,8 +203,16 @@ public sealed class BoringSslStream : Stream
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
-                    int result =
-                        Native.pms_ssl_connect(_connection);
+                    int result;
+                    string? nativeError = null;
+
+                    lock (_nativeSync)
+                    {
+                        result = Native.pms_ssl_connect(_connection);
+
+                        if (result == Native.PMS_SSL_ERROR)
+                            nativeError = GetNativeError();
+                    }
 
                     await FlushWriteBioAsync(
                             cancellationToken)
@@ -221,7 +242,8 @@ public sealed class BoringSslStream : Stream
 
                         default:
                             throw CreateSslException(
-                                "BoringSSL handshake failed");
+                                "BoringSSL handshake failed",
+                                nativeError);
                     }
                 }
             }
@@ -277,19 +299,17 @@ public sealed class BoringSslStream : Stream
         {
             cancellationToken.ThrowIfCancellationRequested();
             int result;
+            string? nativeError = null;
 
-            await _nativeLock.WaitAsync(cancellationToken)
-                .ConfigureAwait(false);
-            try
+            lock (_nativeSync)
             {
                 result = Native.pms_ssl_read(
                     _connection,
                     buffer,
                     length);
-            }
-            finally
-            {
-                _nativeLock.Release();
+
+                if (result == Native.PMS_SSL_ERROR)
+                    nativeError = GetNativeError();
             }
 
             // SSL_read can generate TLS output itself. Only wake the pump;
@@ -317,7 +337,8 @@ public sealed class BoringSslStream : Stream
 
                 default:
                     throw CreateSslException(
-                        "BoringSSL read failed");
+                        "BoringSSL read failed",
+                        nativeError);
             }
         }
     }
@@ -368,19 +389,17 @@ public sealed class BoringSslStream : Stream
             IntPtr current = IntPtr.Add(buffer, offset);
 
             int result;
+            string? nativeError = null;
 
-            await _nativeLock.WaitAsync(cancellationToken)
-                .ConfigureAwait(false);
-            try
+            lock (_nativeSync)
             {
                 result = Native.pms_ssl_write(
                     _connection,
                     current,
                     length - offset);
-            }
-            finally
-            {
-                _nativeLock.Release();
+
+                if (result == Native.PMS_SSL_ERROR)
+                    nativeError = GetNativeError();
             }
 
             await FlushWriteBioAsync(
@@ -411,7 +430,8 @@ public sealed class BoringSslStream : Stream
 
                 default:
                     throw CreateSslException(
-                        "BoringSSL write failed");
+                        "BoringSSL write failed",
+                        nativeError);
             }
         }
     }
@@ -446,27 +466,26 @@ public sealed class BoringSslStream : Stream
 
             IntPtr pointer = GetHandlePointer(handle);
             int accepted;
+            string? nativeError = null;
 
-            await _nativeLock.WaitAsync(cancellationToken)
-                .ConfigureAwait(false);
-            try
+            lock (_nativeSync)
             {
                 accepted =
                     Native.pms_ssl_feed_read(
                         _connection,
                         pointer,
                         read);
-            }
-            finally
-            {
-                _nativeLock.Release();
+
+                if (accepted != read)
+                    nativeError = GetNativeError();
             }
 
             if (accepted != read)
             {
                 throw CreateSslException(
                     $"BoringSSL accepted {accepted} " +
-                    $"of {read} bytes");
+                    $"of {read} bytes",
+                    nativeError);
             }
         }
         finally
@@ -575,24 +594,24 @@ public sealed class BoringSslStream : Stream
         while (true)
         {
             int taken;
+            string? nativeError = null;
 
-            await _nativeLock.WaitAsync(token).ConfigureAwait(false);
-            try
+            lock (_nativeSync)
             {
                 taken = Native.pms_ssl_take_write(
                     _connection,
                     pointer,
                     _pumpBuffer.Length);
-            }
-            finally
-            {
-                _nativeLock.Release();
+
+                if (taken < 0)
+                    nativeError = GetNativeError();
             }
 
             if (taken < 0)
             {
                 throw CreateSslException(
-                    "Failed to read BoringSSL write BIO");
+                    "Failed to read BoringSSL write BIO",
+                    nativeError);
             }
 
             if (taken == 0)
@@ -631,9 +650,12 @@ public sealed class BoringSslStream : Stream
     }
 
     private static IOException CreateSslException(
-        string message)
+        string message,
+        string? nativeError = null)
     {
-        string error = GetNativeError();
+        // The native error is thread-local: when an await sits between the
+        // native call and this method, pass the text captured inside the lock.
+        string error = nativeError ?? GetNativeError();
 
         return new IOException(
             string.IsNullOrWhiteSpace(error)
@@ -864,7 +886,6 @@ public sealed class BoringSslStream : Stream
         {
             _readLock.Dispose();
             _writeLock.Dispose();
-            _nativeLock.Dispose();
 
             if (!_leaveOpen)
                 _innerStream.Dispose();
@@ -883,7 +904,6 @@ public sealed class BoringSslStream : Stream
 
         _readLock.Dispose();
         _writeLock.Dispose();
-        _nativeLock.Dispose();        
 
         if (!_leaveOpen)
         {
@@ -1030,11 +1050,16 @@ public sealed class BoringSslStream : Stream
 
     private void ValidateServerCertificate(string hostname)
     {
-        int certLen = Native.pms_ssl_get_peer_certificate(_connection, IntPtr.Zero, 0);
-        if (certLen < 0)
+        int certLen;
+
+        lock (_nativeSync)
         {
-            throw CreateSslException("Failed to get server certificate size");
+            certLen = Native.pms_ssl_get_peer_certificate(_connection, IntPtr.Zero, 0);
+
+            if (certLen < 0)
+                throw CreateSslException("Failed to get server certificate size");
         }
+
         if (certLen == 0)
         {
             throw new AuthenticationException("The server did not provide an SSL certificate.");
@@ -1047,14 +1072,17 @@ public sealed class BoringSslStream : Stream
             using (MemoryHandle handle = memory.Pin())
             {
                 IntPtr pointer = GetHandlePointer(handle);
-                int readBytes = Native.pms_ssl_get_peer_certificate(
-                    _connection,
-                    pointer,
-                    certLen);
+                int readBytes;
 
-                if (readBytes != certLen)
+                lock (_nativeSync)
                 {
-                    throw CreateSslException("Failed to read complete server certificate");
+                    readBytes = Native.pms_ssl_get_peer_certificate(
+                        _connection,
+                        pointer,
+                        certLen);
+
+                    if (readBytes != certLen)
+                        throw CreateSslException("Failed to read complete server certificate");
                 }
             }
 
