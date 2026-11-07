@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.22)
 project(proxymap_boringssl LANGUAGES C CXX)
 
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../boringssl/CMakeLists.txt")
     message(FATAL_ERROR "BoringSSL was not found. Clone it into ../boringssl")
 endif()
