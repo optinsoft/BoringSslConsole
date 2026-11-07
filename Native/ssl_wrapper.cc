@@ -8,6 +8,7 @@
 #include <sstream>
 #include <vector>
 #include <unordered_map>
+#include <cstring>
 
 #include <brotli/decode.h>
 #include <brotli/encode.h>
