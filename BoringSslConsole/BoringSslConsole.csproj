@@ -6,11 +6,20 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
-  <Target Name="CopyNativeLibrary" AfterTargets="Build">
-    <ItemGroup>
-      <NativeLibraries Include="$(MSBuildProjectDirectory)/../Native/build/proxymap_boringssl.dll" Condition="Exists('$(MSBuildProjectDirectory)/../Native/build/proxymap_boringssl.dll')" />
-      <NativeLibraries Include="$(MSBuildProjectDirectory)/../Native/build/libproxymap_boringssl.so" Condition="Exists('$(MSBuildProjectDirectory)/../Native/build/libproxymap_boringssl.so')" />
-    </ItemGroup>
-    <Copy SourceFiles="@(NativeLibraries)" DestinationFolder="$(OutputPath)" />
+  <ItemGroup>
+    <!-- Native library: .dll for Windows, .so for Linux. CopyToOutputDirectory
+         items flow transitively through ProjectReference to test projects. -->
+    <None Include="../Native/build/proxymap_boringssl.dll"
+          Link="proxymap_boringssl.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          Condition="Exists('../Native/build/proxymap_boringssl.dll')" />
+    <None Include="../Native/build/libproxymap_boringssl.so"
+          Link="libproxymap_boringssl.so"
+          CopyToOutputDirectory="PreserveNewest"
+          Condition="Exists('../Native/build/libproxymap_boringssl.so')" />
+  </ItemGroup>
+  <Target Name="EnsureNativeLibrary" BeforeTargets="Build"
+          Condition="!Exists('../Native/build/proxymap_boringssl.dll') AND !Exists('../Native/build/libproxymap_boringssl.so')">
+    <Warning Text="Native library not found in ../Native/build. Run Native/build.ps1 (Windows) or Native/build.sh (Linux) first." />
   </Target>
 </Project>

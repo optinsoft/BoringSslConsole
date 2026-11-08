@@ -26,6 +26,13 @@ add_subdirectory(
 
 add_library(proxymap_boringssl SHARED ssl_wrapper.cc)
 
+# MSVC produces proxymap_boringssl.dll, but MinGW-based toolchains prefix
+# shared libraries with "lib" (libproxymap_boringssl.dll). Strip the prefix
+# so the DLL name always matches the P/Invoke name on Windows.
+if(WIN32)
+    set_target_properties(proxymap_boringssl PROPERTIES PREFIX "")
+endif()
+
 target_include_directories(proxymap_boringssl PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../boringssl/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/../brotli/c/include"
