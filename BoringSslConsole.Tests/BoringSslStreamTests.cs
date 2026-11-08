@@ -401,6 +401,108 @@ public sealed class BoringSslStreamTests
         }
     }
 
+    [Fact]
+    public async Task AuthenticateWithSslClientAuthenticationOptions_ShouldApplyAlpnAndCallback()
+    {
+        using var timeout =
+            new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        using var certificate = CreateCertificate();
+
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        SslPolicyErrors? observedPolicyErrors = null;
+
+        try
+        {
+            Task serverTask = RunAlpnServerAsync(
+                listener,
+                certificate,
+                timeout.Token);
+
+            using var client = new TcpClient();
+
+            await client.ConnectAsync(
+                IPAddress.Loopback,
+                port,
+                timeout.Token);
+
+            await using var networkStream = client.GetStream();
+
+            using var sslStream = new BoringSslStream(
+                networkStream,
+                Host,
+                leaveOpen: true);
+
+            await sslStream.AuthenticateAsClientAsync(
+                new SslClientAuthenticationOptions
+                {
+                    TargetHost = Host,
+                    ApplicationProtocols = new List<SslApplicationProtocol>
+                    {
+                        new("http/1.1")
+                    },
+                    RemoteCertificateValidationCallback = (_, _, _, errors) =>
+                    {
+                        observedPolicyErrors = errors;
+                        return true;
+                    },
+                    CertificateRevocationCheckMode = X509RevocationMode.NoCheck
+                },
+                timeout.Token);
+
+            // The constructor default ALPN is "h2:http/1.1"; the server
+            // accepts both, so the negotiated protocol proves that the
+            // ApplicationProtocols override was applied.
+            Assert.Equal("http/1.1", sslStream.AlpnSelected);
+
+            // The self-signed certificate must surface as a chain error,
+            // exactly like SslStream reports it to the callback.
+            Assert.Equal(
+                SslPolicyErrors.RemoteCertificateChainErrors,
+                observedPolicyErrors);
+
+            await serverTask.WaitAsync(timeout.Token);
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    private static async Task RunAlpnServerAsync(
+        TcpListener listener,
+        X509Certificate2 certificate,
+        CancellationToken cancellationToken)
+    {
+        using TcpClient client =
+            await listener.AcceptTcpClientAsync(
+                cancellationToken);
+
+        await using NetworkStream networkStream =
+            client.GetStream();
+
+        await using var sslStream =
+            new SslStream(
+                networkStream,
+                leaveInnerStreamOpen: true);
+
+        await sslStream.AuthenticateAsServerAsync(
+            new SslServerAuthenticationOptions
+            {
+                ServerCertificate = certificate,
+                ApplicationProtocols = new List<SslApplicationProtocol>
+                {
+                    SslApplicationProtocol.Http2,
+                    SslApplicationProtocol.Http11
+                }
+            },
+            cancellationToken);
+    }
+
     private static async Task RunEchoServerAsync(
         TcpListener listener,
         X509Certificate2 certificate,
@@ -512,8 +614,7 @@ public sealed class BoringSslStreamTests
                 DateTimeOffset.UtcNow.AddMinutes(-5),
                 DateTimeOffset.UtcNow.AddHours(1));
 
-        return X509CertificateLoader.LoadPkcs12(
-            certificate.Export(X509ContentType.Pfx),
-            password: null);
+        return new X509Certificate2(
+            certificate.Export(X509ContentType.Pfx));
     }
 }

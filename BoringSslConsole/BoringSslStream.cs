@@ -1,7 +1,9 @@
 namespace BoringSslConsole;
 
 using System.Buffers;
+using System.Net.Security;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading.Channels;
@@ -39,9 +41,27 @@ public sealed class BoringSslStream : Stream
     private const int NetworkBufferSize = 16 * 1024;
 
     private readonly Stream _innerStream;
-    private readonly string _hostname;
+    private string _hostname;
     private readonly bool _leaveOpen;
-    private readonly Native.SslHandle _connection = new();
+    private Native.SslHandle _connection = new();
+
+    // Parameters captured for the native connection factory, so the
+    // connection can be re-created when SslClientAuthenticationOptions
+    // override the constructor defaults before the handshake starts.
+    private readonly string _cipherList;
+    private readonly int _enableGrease;
+    private readonly int _enableEchGrease;
+    private string _alpnProtos;
+    private readonly string _alpsProtos;
+    private readonly string _trustAnchors;
+    private readonly string _sigAlgs;
+    private readonly int _enableSignedCertTimestamps;
+    private readonly int _setOcspStatusType;
+    private readonly int _enableBrotli;
+
+    // SslClientAuthenticationOptions-compatible managed validation.
+    private RemoteCertificateValidationCallback? _sslValidationCallback;
+    private X509RevocationMode _revocationMode = X509RevocationMode.Online;
 
     // SSL* is not accessed concurrently.
     private readonly SemaphoreSlim _readLock = new(1, 1);
@@ -107,18 +127,36 @@ public sealed class BoringSslStream : Stream
         _hostname = hostname;
         _leaveOpen = leaveOpen;
 
+        _cipherList = cipherList;
+        _enableGrease = enableGrease;
+        _enableEchGrease = enableEchGrease;
+        _alpnProtos = alpnProtos;
+        _alpsProtos = alpsProtos;
+        _trustAnchors = trustAnchors;
+        _sigAlgs = sigAlgs;
+        _enableSignedCertTimestamps = enableSignedCertTimestamps;
+        _setOcspStatusType = setOcspStatusType;
+        _enableBrotli = enableBrotli;
+
+        var connection = CreateConnection(hostname, alpnProtos);
+
+        Marshal.InitHandle(_connection, connection);
+    }
+
+    private IntPtr CreateConnection(string hostname, string alpnProtos)
+    {
         var connection = Native.pms_ssl_create(
             hostname,
-            cipherList,
-            enableGrease,
-            enableEchGrease,
+            _cipherList,
+            _enableGrease,
+            _enableEchGrease,
             alpnProtos,
-            alpsProtos,
-            trustAnchors,
-            sigAlgs,
-            enableSignedCertTimestamps,
-            setOcspStatusType,
-            enableBrotli);
+            _alpsProtos,
+            _trustAnchors,
+            _sigAlgs,
+            _enableSignedCertTimestamps,
+            _setOcspStatusType,
+            _enableBrotli);
 
         if (connection == IntPtr.Zero)
         {
@@ -127,7 +165,100 @@ public sealed class BoringSslStream : Stream
                 $"{GetNativeError()}");
         }
 
-        Marshal.InitHandle(_connection, connection);
+        return connection;
+    }
+
+    /// <summary>
+    /// Re-creates the native SSL connection with a new target host and/or
+    /// ALPN list. Only allowed before the handshake has started.
+    /// </summary>
+    private void RecreateConnection(string hostname, string alpnProtos)
+    {
+        if (_pumpTask is not null || _authenticated)
+        {
+            throw new InvalidOperationException(
+                "SSL options can only be applied before the handshake starts.");
+        }
+
+        _connection.Dispose();
+
+        var handle = new Native.SslHandle();
+        Marshal.InitHandle(handle, CreateConnection(hostname, alpnProtos));
+
+        _hostname = hostname;
+        _alpnProtos = alpnProtos;
+        _connection = handle;
+    }
+
+    /// <summary>
+    /// SslStream-compatible overload. Maps a subset of
+    /// SslClientAuthenticationOptions onto BoringSslStream:
+    /// TargetHost and ApplicationProtocols (re-creates the native
+    /// connection), RemoteCertificateValidationCallback and
+    /// CertificateRevocationCheckMode (managed validation).
+    /// </summary>
+    public ValueTask AuthenticateAsClientAsync(
+        SslClientAuthenticationOptions? clientOptions,
+        CancellationToken cancellationToken = default)
+    {
+        if (clientOptions is not null)
+        {
+            ApplyClientOptions(clientOptions);
+        }
+
+        return AuthenticateAsClientAsync(cancellationToken);
+    }
+
+    private void ApplyClientOptions(SslClientAuthenticationOptions options)
+    {
+        if (_pumpTask is not null || _authenticated)
+        {
+            throw new InvalidOperationException(
+                "SSL options can only be applied before the handshake starts.");
+        }
+
+        string hostname = _hostname;
+        if (!string.IsNullOrEmpty(options.TargetHost) &&
+            !string.Equals(options.TargetHost, _hostname, StringComparison.OrdinalIgnoreCase))
+        {
+            hostname = options.TargetHost;
+        }
+
+        string alpnProtos = _alpnProtos;
+        if (options.ApplicationProtocols is { Count: > 0 } applicationProtocols)
+        {
+            alpnProtos = string.Join(":", applicationProtocols.Select(p => Encoding.UTF8.GetString(p.Protocol.Span)));
+        }
+
+        if (!string.Equals(hostname, _hostname, StringComparison.Ordinal) ||
+            !string.Equals(alpnProtos, _alpnProtos, StringComparison.Ordinal))
+        {
+            RecreateConnection(hostname, alpnProtos);
+        }
+
+        _sslValidationCallback = options.RemoteCertificateValidationCallback;
+        _revocationMode = options.CertificateRevocationCheckMode;
+
+        if (options.EnabledSslProtocols is { } enabledProtocols &&
+            enabledProtocols != SslProtocols.None &&
+            (enabledProtocols & (SslProtocols.Tls12 | SslProtocols.Tls13)) == 0)
+        {
+            throw new NotSupportedException(
+                $"BoringSSL supports TLS 1.2 and TLS 1.3 only " +
+                $"(EnabledSslProtocols: {enabledProtocols}).");
+        }
+
+        if (options.ClientCertificates is { Count: > 0 })
+        {
+            throw new NotSupportedException(
+                "Client certificates (mTLS) are not supported by BoringSslStream.");
+        }
+
+        if (options.LocalCertificateSelectionCallback is not null)
+        {
+            throw new NotSupportedException(
+                "Local certificate selection is not supported by BoringSslStream.");
+        }
     }
 
     public string ProtocolVersion
@@ -1088,9 +1219,44 @@ public sealed class BoringSslStream : Stream
 
             using var certificate = new X509Certificate2(memory.Span);
 
-            if (RemoteCertificateValidationCallback is { } validate)
+            if (_sslValidationCallback is { } validate)
             {
-                if (!validate(certificate))
+                // SslStream-style callback: build the chain, compute the
+                // policy errors and let the callback make the decision.
+                using var chain = new X509Chain();
+                chain.ChainPolicy.RevocationMode = _revocationMode;
+                chain.ChainPolicy.RevocationFlag = X509RevocationFlag.ExcludeRoot;
+                chain.ChainPolicy.ApplicationPolicy.Add(
+                    new System.Security.Cryptography.Oid("1.3.6.1.5.5.7.3.1")); // Server Auth
+
+                chain.Build(certificate);
+
+                var policyErrors = SslPolicyErrors.None;
+
+                if (chain.ChainElements.Count == 0 ||
+                    chain.ChainStatus.Any(s => s.Status != X509ChainStatusFlags.NoError))
+                {
+                    policyErrors |= SslPolicyErrors.RemoteCertificateChainErrors;
+                }
+
+                if (!certificate.MatchesHostname(hostname))
+                {
+                    policyErrors |= SslPolicyErrors.RemoteCertificateNameMismatch;
+                }
+
+                if (!validate(this, certificate, chain, policyErrors))
+                {
+                    throw new AuthenticationException(
+                        "The server certificate was rejected by " +
+                        "RemoteCertificateValidationCallback.");
+                }
+
+                return;
+            }
+
+            if (RemoteCertificateValidationCallback is { } validateSimple)
+            {
+                if (!validateSimple(certificate))
                 {
                     throw new AuthenticationException(
                         "The server certificate was rejected by RemoteCertificateValidationCallback.");
@@ -1098,15 +1264,15 @@ public sealed class BoringSslStream : Stream
                 return;
             }
 
-            using var chain = new X509Chain();
-            chain.ChainPolicy.RevocationMode = X509RevocationMode.Online;
-            chain.ChainPolicy.RevocationFlag = X509RevocationFlag.ExcludeRoot;
+            using var defaultChain = new X509Chain();
+            defaultChain.ChainPolicy.RevocationMode = _revocationMode;
+            defaultChain.ChainPolicy.RevocationFlag = X509RevocationFlag.ExcludeRoot;
 
-            chain.ChainPolicy.ApplicationPolicy.Add(new System.Security.Cryptography.Oid("1.3.6.1.5.5.7.3.1")); // Server Auth
+            defaultChain.ChainPolicy.ApplicationPolicy.Add(new System.Security.Cryptography.Oid("1.3.6.1.5.5.7.3.1")); // Server Auth
 
-            if (!chain.Build(certificate))
+            if (!defaultChain.Build(certificate))
             {
-                var errors = string.Join(", ", chain.ChainStatus.Select(s => s.StatusInformation.Trim()));
+                var errors = string.Join(", ", defaultChain.ChainStatus.Select(s => s.StatusInformation.Trim()));
                 throw new AuthenticationException($"Certificate chain validation failed: {errors}");
             }
 
