@@ -7,8 +7,10 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <Target Name="CopyNativeLibrary" AfterTargets="Build">
-    <Copy SourceFiles="$(MSBuildProjectDirectory)/../Native/build/proxymap_boringssl.dll"
-          DestinationFolder="$(OutputPath)"
-          Condition="Exists('$(MSBuildProjectDirectory)/../Native/build/proxymap_boringssl.dll')" />
+    <ItemGroup>
+      <NativeLibraries Include="$(MSBuildProjectDirectory)/../Native/build/proxymap_boringssl.dll" Condition="Exists('$(MSBuildProjectDirectory)/../Native/build/proxymap_boringssl.dll')" />
+      <NativeLibraries Include="$(MSBuildProjectDirectory)/../Native/build/libproxymap_boringssl.so" Condition="Exists('$(MSBuildProjectDirectory)/../Native/build/libproxymap_boringssl.so')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(NativeLibraries)" DestinationFolder="$(OutputPath)" />
   </Target>
 </Project>

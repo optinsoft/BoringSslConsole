@@ -23,10 +23,14 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="..\Native\build\proxymap_boringssl.dll"
+    <None Include="../Native/build/proxymap_boringssl.dll"
           Link="proxymap_boringssl.dll"
           CopyToOutputDirectory="PreserveNewest"
-          Condition="Exists('..\Native\build\proxymap_boringssl.dll')" />
+          Condition="Exists('../Native/build/proxymap_boringssl.dll')" />
+    <None Include="../Native/build/libproxymap_boringssl.so"
+          Link="libproxymap_boringssl.so"
+          CopyToOutputDirectory="PreserveNewest"
+          Condition="Exists('../Native/build/libproxymap_boringssl.so')" />
   </ItemGroup>
 
 </Project>
